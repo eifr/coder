@@ -169,7 +169,41 @@ interface CreateChatStreamOptions {
   system?: string
 }
 
-export function createChatStream({ provider, model, messages, system }: CreateChatStreamOptions) {
+export function createTools(readFileFn: (path: string) => Promise<string | null>, editFileFn: (path: string, content: string) => Promise<boolean>): any {
+  return {
+    readFile: {
+      description: 'Read the contents of a file in the project',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'File path relative to project root' },
+        },
+        required: ['path'],
+      },
+      execute: async ({ path }: { path: string }) => {
+        const content = await readFileFn(path)
+        return content ? { path, content } : { error: `File not found: ${path}` }
+      },
+    },
+    editFile: {
+      description: 'Write content to a file. Creates the file if it does not exist, overwrites if it does.',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'File path relative to project root' },
+          content: { type: 'string', description: 'Full file content to write' },
+        },
+        required: ['path', 'content'],
+      },
+      execute: async ({ path, content }: { path: string; content: string }) => {
+        const ok = await editFileFn(path, content)
+        return ok ? { path, success: true } : { error: `Failed to write ${path}` }
+      },
+    },
+  }
+}
+
+export function createChatStream({ provider, model, messages, system, tools }: CreateChatStreamOptions & { tools?: Record<string, any> }) {
   const chatModel = model || (provider === PROVIDERS.BROWSER_AI ? browserAI() : null)
   if (!chatModel) throw new Error(`Model not initialized for provider: ${provider}`)
 
@@ -180,6 +214,7 @@ export function createChatStream({ provider, model, messages, system }: CreateCh
     temperature: 0.3,
     maxOutputTokens: 4096,
     topP: 0.95,
+    tools: tools as any,
     allowSystemInMessages: true,
   })
 }

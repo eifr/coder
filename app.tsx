@@ -1,5 +1,5 @@
 import { html, render, useState, useEffect, useRef, useCallback, useMemo } from 'htm/preact/standalone.mjs'
-import { PROVIDERS, getAvailableModels, estimateVRAM, getPreferredModel, checkProviderAvailability, initProviderModel, createChatStream, type Provider, type ModelDescriptor } from './llm-provider'
+import { PROVIDERS, getAvailableModels, estimateVRAM, getPreferredModel, checkProviderAvailability, initProviderModel, createChatStream, createTools, type Provider, type ModelDescriptor } from './llm-provider'
 import type { LanguageModel, ModelMessage } from 'ai'
 
 interface FileEntry {
@@ -74,7 +74,11 @@ const LANG_MAP: Record<string, string> = {
 
 const SYSTEM_PROMPT = `You are WebCoder, an AI coding assistant running entirely inside the user's browser. All computation is local and private.
 
-You have access to the project file tree. Use the available tools to read file contents when needed.
+You have access to tools:
+- readFile(path): Read file contents
+- editFile(path, content): Write content to a file (creates or overwrites)
+
+Use readFile to examine files before making changes. Use editFile to directly apply changes to files.
 
 When suggesting code changes, ALWAYS use a code block with a file path header like this:
 \`\`\`language:path/to/file.js
@@ -290,10 +294,10 @@ function stopGeneration(): void {
   }
 }
 
-async function* streamChat(messages: ModelMessage[], system?: string): AsyncGenerator<ChatChunk> {
+async function* streamChat(messages: ModelMessage[], system?: string, tools?: Record<string, any>): AsyncGenerator<ChatChunk> {
   if (!currentModel) throw new Error('Model not initialized')
   try {
-    const result = createChatStream({ provider: (currentModel as any).provider || PROVIDERS.WEBLLM, model: currentModel, messages, system })
+    const result = createChatStream({ provider: (currentModel as any).provider || PROVIDERS.WEBLLM, model: currentModel, messages, system, tools })
     let full = ''
     for await (const chunk of result.textStream) {
       if (abortController?.signal.aborted) break
@@ -343,6 +347,17 @@ function buildFileTree(treeData: FileEntry[]): string {
   }
   flat(treeData)
   return lines.join('\n')
+}
+
+async function readFileForTool(path: string): Promise<string | null> {
+  const entry = fileHandles.get(path)
+  if (!entry) return null
+  try {
+    const content = await readFileContent(entry.handle as FileSystemFileHandle)
+    return content
+  } catch {
+    return null
+  }
 }
 
 interface SidebarProps {
@@ -659,9 +674,11 @@ function App() {
       { role: 'user', content: text },
     ]
 
+    const tools = attachContext ? createTools(readFileForTool, applyFileChanges) : undefined
+
     try {
       let full = ''
-      for await (const chunk of streamChat(chatMsgs, systemMsg)) {
+      for await (const chunk of streamChat(chatMsgs, systemMsg, tools)) {
         if (abortRef.current) break
         full = chunk.text
         setStreamingContent(full)
