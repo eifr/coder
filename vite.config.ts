@@ -6,7 +6,7 @@ import { VitePWA } from 'vite-plugin-pwa'
 export default defineConfig({
   plugins: [preact(), tailwindcss(), VitePWA({
     registerType: 'autoUpdate',
-    includeAssets: ['icon.svg'],
+    includeAssets: ['icon.svg', 'icon-192.png', 'icon-512.png'],
     manifest: {
       name: 'WebCoder',
       short_name: 'WebCoder',
@@ -15,9 +15,12 @@ export default defineConfig({
       background_color: '#1e1e1e',
       display: 'standalone',
       orientation: 'any',
+      prefer_related_applications: false,
       icons: [
-        { src: 'icon.svg', sizes: '192x192', type: 'image/svg+xml' },
-        { src: 'icon.svg', sizes: '512x512', type: 'image/svg+xml' }
+        { src: 'icon.svg', sizes: '192x192', type: 'image/svg+xml', purpose: 'any' },
+        { src: 'icon.svg', sizes: '512x512', type: 'image/svg+xml', purpose: 'any' },
+        { src: 'icon-192.png', sizes: '192x192', type: 'image/png', purpose: 'any maskable' },
+        { src: 'icon-512.png', sizes: '512x512', type: 'image/png', purpose: 'any maskable' }
       ]
     },
     workbox: {
