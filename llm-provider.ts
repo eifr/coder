@@ -237,7 +237,7 @@ export function createTools(
   }
 }
 
-export function createChatStream({ provider, model, messages, system, tools }: CreateChatStreamOptions & { tools?: Record<string, any> }) {
+export function createChatStream({ provider, model, messages, system, tools, abortSignal }: CreateChatStreamOptions & { tools?: Record<string, any>; abortSignal?: AbortSignal }) {
   const chatModel = model || (provider === PROVIDERS.BROWSER_AI ? browserAI() : null)
   if (!chatModel) throw new Error(`Model not initialized for provider: ${provider}`)
 
@@ -250,5 +250,6 @@ export function createChatStream({ provider, model, messages, system, tools }: C
     topP: 0.95,
     tools: tools as any,
     allowSystemInMessages: true,
+    abortSignal,
   })
 }

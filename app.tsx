@@ -374,16 +374,22 @@ function stopGeneration(): void {
   }
 }
 
-async function* streamChat(messages: ModelMessage[], system?: string, tools?: Record<string, any>): AsyncGenerator<ChatChunk> {
+async function* streamChat(messages: ModelMessage[], system?: string, tools?: Record<string, any>, signal?: AbortSignal): AsyncGenerator<ChatChunk> {
   if (!currentModel) throw new Error('Model not initialized')
+  let full = ''
   try {
-    const result = createChatStream({ provider: (currentModel as any).provider || PROVIDERS.WEBLLM, model: currentModel, messages, system, tools })
-    let full = ''
-    for await (const chunk of result.textStream) {
-      if (abortController?.signal.aborted) break
-      full += chunk
-      const cleaned = full.replace(/<think>[\s\S]*?<\/think>/g, '').trim()
-      yield { text: cleaned, done: false, delta: chunk, usage: null }
+    const result = createChatStream({ provider: (currentModel as any).provider || PROVIDERS.WEBLLM, model: currentModel, messages, system, tools, abortSignal: signal })
+    for await (const part of result.fullStream) {
+      if (signal?.aborted) break
+      if (part.type === 'text-delta') {
+        full += part.text
+        const cleaned = full.replace(/<think>[\s\S]*?<\/think>/g, '').trim()
+        yield { text: cleaned, done: false, delta: part.text, usage: null }
+      } else if (part.type === 'tool-call') {
+        console.log('Tool call:', part.toolName, part.input)
+      } else if (part.type === 'tool-result') {
+        console.log('Tool result:', part.toolName, part.output)
+      }
     }
     const cleaned = full.replace(/<think>[\s\S]*?<\/think>/g, '').trim()
     yield { text: cleaned, done: true, delta: '', usage: null }
@@ -392,11 +398,13 @@ async function* streamChat(messages: ModelMessage[], system?: string, tools?: Re
     if (msg.includes('mapAsync') || msg.includes('Buffer was unmapped')) {
       console.warn('GPU buffer error, retrying...')
       await new Promise(r => setTimeout(r, 500))
-      yield { text: '', done: true, delta: '', usage: null }
+      const cleaned = full.replace(/<think>[\s\S]*?<\/think>/g, '').trim()
+      yield { text: cleaned, done: true, delta: '', usage: null }
       return
     }
     if (abortController?.signal.aborted) {
-      yield { text: '', done: true, delta: '', usage: null }
+      const cleaned = full.replace(/<think>[\s\S]*?<\/think>/g, '').trim()
+      yield { text: cleaned, done: true, delta: '', usage: null }
       return
     }
     throw err
@@ -800,6 +808,7 @@ function App() {
   const handleSend = useCallback(async (text: string) => {
     if (!currentModel || !modelLoaded || generatingRef.current) return
     generatingRef.current = true
+    abortController = new AbortController()
     const userMsg: Message = { role: 'user', content: text }
     const newMsgs = [...messages, userMsg]
     setMessages(newMsgs)
@@ -809,16 +818,25 @@ function App() {
     abortRef.current = false
 
     const fileTree = attachContext && treeData ? buildFileTree(treeData) : null
-    const systemMsg = fileTree ? `${SYSTEM_PROMPT}\n\nProject file tree:\n${fileTree}` : SYSTEM_PROMPT
+    let systemMsg = fileTree ? `${SYSTEM_PROMPT}\n\nProject file tree:\n${fileTree}` : SYSTEM_PROMPT
     const chatMsgs: ModelMessage[] = [
       { role: 'user', content: text },
     ]
 
-    const tools = attachContext ? createTools(readFileForTool, applyFileChanges, createFileForTool, deleteFileForTool) : undefined
+    const isChromeAI = selectedProvider === PROVIDERS.BROWSER_AI
+    let tools = attachContext && !isChromeAI ? createTools(readFileForTool, applyFileChanges, createFileForTool, deleteFileForTool) : undefined
+
+    if (isChromeAI && attachContext && currentFilePath && editor) {
+      const model = editor.getModel()
+      if (model) {
+        const fileContent = model.getValue()
+        systemMsg += `\n\nCurrent open file: ${currentFilePath}\n\`\`\`\n${fileContent}\n\`\`\``
+      }
+    }
 
     try {
       let full = ''
-      for await (const chunk of streamChat(chatMsgs, systemMsg, tools)) {
+      for await (const chunk of streamChat(chatMsgs, systemMsg, tools, abortController.signal)) {
         if (abortRef.current) break
         full = chunk.text
         setStreamingContent(full)
@@ -838,7 +856,7 @@ function App() {
       setIsGenerating(false)
       setStreamingContent('')
     }
-  }, [messages, modelLoaded, currentModel, attachContext, treeData])
+  }, [messages, modelLoaded, currentModel, attachContext, treeData, selectedProvider])
 
   const handleStop = useCallback(() => { abortRef.current = true; stopGeneration() }, [])
   const handleClear = useCallback(() => { setMessages([]); setStreamingContent(''); setCodeBlocks([]); saveState({ messages: [] }) }, [])
