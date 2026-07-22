@@ -812,7 +812,7 @@ function App() {
       { role: 'user', content: text },
     ]
 
-    const tools = attachContext ? createTools(readFileForTool, applyFileChanges, createFileForTool, deleteFileForTool) : undefined
+    const tools = attachContext && (currentModel as any).provider !== PROVIDERS.WEBLLM ? createTools(readFileForTool, applyFileChanges, createFileForTool, deleteFileForTool) : undefined
 
     try {
       let full = ''
