@@ -2,9 +2,38 @@ import { html, render, useState, useEffect, useRef, useCallback, useMemo } from 
 import { PROVIDERS, getAvailableModels, estimateVRAM, getPreferredModel, checkProviderAvailability, initProviderModel, createChatStream, createTools, type Provider, type ModelDescriptor } from './llm-provider'
 import type { LanguageModel, ModelMessage } from 'ai'
 
-globalThis.AI_SDK_LOG_WARNINGS = false
+interface Notification {
+  id: number
+  text: string
+  level: 'info' | 'warning' | 'error'
+}
 
-globalThis.AI_SDK_LOG_WARNINGS = false
+let notificationId = 0
+const notifications: Notification[] = []
+const notificationListeners: Array<() => void> = []
+
+function addNotification(text: string, level: Notification['level'] = 'info') {
+  notifications.push({ id: ++notificationId, text, level })
+  notificationListeners.forEach(fn => fn())
+  setTimeout(() => {
+    const idx = notifications.findIndex(n => n.id === notificationId)
+    if (idx >= 0) {
+      notifications.splice(idx, 1)
+      notificationListeners.forEach(fn => fn())
+    }
+  }, 8000)
+}
+
+// Hook into AI SDK warnings
+const origWarn = console.warn
+console.warn = (...args: any[]) => {
+  const msg = args.join(' ')
+  if (msg.includes('AI SDK Warning')) {
+    const match = msg.match(/AI SDK Warning[^:]*:\s*(.+)/)
+    if (match) addNotification(match[1], 'warning')
+  }
+  origWarn.apply(console, args)
+}
 
 interface FileEntry {
   name: string
@@ -686,6 +715,16 @@ function App() {
   const [attachContext, setAttachContext] = useState(saved.attachContext ?? true)
   const [customModelUrl, setCustomModelUrl] = useState(saved.customModelUrl || '')
   const [fileStatus, setFileStatus] = useState('')
+  const [notifs, setNotifs] = useState<Notification[]>([])
+
+  useEffect(() => {
+    const update = () => setNotifs([...notifications])
+    notificationListeners.push(update)
+    return () => {
+      const idx = notificationListeners.indexOf(update)
+      if (idx >= 0) notificationListeners.splice(idx, 1)
+    }
+  }, [])
 
   const editorRef = useRef<HTMLDivElement | null>(null)
   const abortRef = useRef(false)
@@ -842,6 +881,16 @@ function App() {
 
   return html`
     <div class="h-screen flex flex-col bg-[#1e1e1e] text-gray-200 text-sm">
+      ${notifs.length > 0 ? html`
+        <div class="fixed top-12 right-4 z-50 space-y-2 max-w-sm">
+          ${notifs.map(n => html`
+            <div key=${n.id} class="px-3 py-2 rounded text-xs border ${n.level === 'warning' ? 'bg-yellow-900/90 border-yellow-700 text-yellow-200' : n.level === 'error' ? 'bg-red-900/90 border-red-700 text-red-200' : 'bg-blue-900/90 border-blue-700 text-blue-200'}">
+              <div class="font-medium mb-0.5">${n.level === 'warning' ? '⚠️ Warning' : n.level === 'error' ? '❌ Error' : 'ℹ️ Info'}</div>
+              <div class="opacity-90">${n.text}</div>
+            </div>
+          `)}
+        </div>
+      ` : ''}
       <header class="h-9 bg-[#1e1e1e] border-b border-[#3c3c3c] flex items-center px-4 shrink-0">
         <span class="font-semibold text-gray-200 text-sm tracking-wide">WebCoder</span>
         <span class="text-xs text-gray-500 ml-3 hidden sm:inline">Local-First AI Editor</span>
