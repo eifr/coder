@@ -74,7 +74,7 @@ const LANG_MAP: Record<string, string> = {
 
 const SYSTEM_PROMPT = `You are WebCoder, an AI coding assistant running entirely inside the user's browser. All computation is local and private.
 
-You will be given a "Project context" system message containing the file tree and key file contents of the user's project. Use this context to answer questions about the codebase, suggest changes, and help with coding tasks. If the context is not provided, ask the user to attach it.
+You have access to the project file tree. Use the available tools to read file contents when needed.
 
 When suggesting code changes, ALWAYS use a code block with a file path header like this:
 \`\`\`language:path/to/file.js
@@ -333,7 +333,7 @@ function parseCodeBlocks(text: string): CodeBlock[] {
   return blocks
 }
 
-async function buildContextString(treeData: FileEntry[]): Promise<string> {
+function buildFileTree(treeData: FileEntry[]): string {
   const lines = [`Project: ${rootDirName}`, '']
   function flat(entries: FileEntry[], p = '') {
     for (const e of entries) {
@@ -342,27 +342,6 @@ async function buildContextString(treeData: FileEntry[]): Promise<string> {
     }
   }
   flat(treeData)
-  lines.push('', '--- Key file contents ---', '')
-  let count = 0
-  async function readFiles(entries: FileEntry[]) {
-    for (const e of entries) {
-      if (count >= MAX_CONTEXT_FILES) return
-      if (e.type === 'dir') { if (e.children) await readFiles(e.children) }
-      else {
-        const ext = e.path.match(/(\.[^.]+)$/)?.[1] || ''
-        if (new Set(['.png','.jpg','.jpeg','.gif','.ico','.webp','.bmp','.woff','.woff2','.ttf','.eot','.zip','.tar','.gz','.mp3','.mp4','.avi','.mov','.pdf','.bin','.exe','.dll','.so','.dylib','.o','.a','.class']).has(ext)) return
-        const entry = fileHandles.get(e.path)
-        if (!entry) return
-        try {
-          const c = await readFileContent(entry.handle as FileSystemFileHandle)
-          lines.push(`\n--- ${e.path} ${c.length > MAX_CONTEXT_FILE_SIZE ? `(truncated ${c.length} bytes)` : ''} ---`)
-          lines.push(c.length > MAX_CONTEXT_FILE_SIZE ? c.slice(0, MAX_CONTEXT_FILE_SIZE) + '\n... (truncated)' : c)
-          count++
-        } catch {}
-      }
-    }
-  }
-  await readFiles(treeData)
   return lines.join('\n')
 }
 
@@ -674,10 +653,8 @@ function App() {
     setCodeBlocks([])
     abortRef.current = false
 
-    let ctx: string | null = null
-    if (attachContext && treeData) { try { ctx = await buildContextString(treeData) } catch {} }
-
-    const systemMsg = ctx ? `${SYSTEM_PROMPT}\n\nProject context:\n${ctx}` : SYSTEM_PROMPT
+    const fileTree = attachContext && treeData ? buildFileTree(treeData) : null
+    const systemMsg = fileTree ? `${SYSTEM_PROMPT}\n\nProject file tree:\n${fileTree}` : SYSTEM_PROMPT
     const chatMsgs: ModelMessage[] = [
       { role: 'user', content: text },
     ]
