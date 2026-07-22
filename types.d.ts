@@ -8,6 +8,11 @@ declare module 'htm/preact/standalone.mjs' {
   export function useMemo<T>(fn: () => T, deps: any[]): T
 }
 
+declare module '*?worker' {
+  const WorkerConstructor: new () => Worker
+  export default WorkerConstructor
+}
+
 interface FileSystemHandlePermissionDescriptor {
   mode?: 'read' | 'readwrite'
 }
@@ -19,8 +24,6 @@ interface FileSystemHandle {
 
 interface Window {
   showDirectoryPicker?(): Promise<FileSystemDirectoryHandle>
-  require?: {
-    config: (cfg: { paths: { vs: string } }) => void
-  } & ((deps: string[], callback: () => void) => void)
-  monaco?: any
 }
+
+declare const self: WorkerGlobalScope

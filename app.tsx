@@ -85,7 +85,32 @@ const EXCLUDED = new Set(['node_modules','.git','dist','.DS_Store','__pycache__'
 const MAX_DEPTH = 8
 const MAX_CONTEXT_FILES = 8
 const MAX_CONTEXT_FILE_SIZE = 1500
-const MONACO_CDN = 'https://cdn.jsdelivr.net/npm/monaco-editor@0.55.1/min/vs'
+import * as monaco from 'monaco-editor'
+
+self.MonacoEnvironment = {
+  getWorker: () => null as any
+}
+
+monaco.languages.register({ id: 'plaintext' })
+monaco.languages.register({ id: 'javascript' })
+monaco.languages.register({ id: 'typescript' })
+monaco.languages.register({ id: 'python' })
+monaco.languages.register({ id: 'html' })
+monaco.languages.register({ id: 'css' })
+monaco.languages.register({ id: 'json' })
+monaco.languages.register({ id: 'markdown' })
+monaco.languages.register({ id: 'xml' })
+monaco.languages.register({ id: 'yaml' })
+monaco.languages.register({ id: 'shell' })
+monaco.languages.register({ id: 'sql' })
+monaco.languages.register({ id: 'rust' })
+monaco.languages.register({ id: 'go' })
+monaco.languages.register({ id: 'java' })
+monaco.languages.register({ id: 'ruby' })
+monaco.languages.register({ id: 'php' })
+monaco.languages.register({ id: 'c' })
+monaco.languages.register({ id: 'cpp' })
+monaco.languages.register({ id: 'graphql' })
 const LANG_MAP: Record<string, string> = {
   '.js':'javascript','.jsx':'javascript','.mjs':'javascript','.cjs':'javascript',
   '.ts':'typescript','.tsx':'typescript',
@@ -216,7 +241,7 @@ async function loadFile(path: string): Promise<string | null> {
       if (m.getValue() !== content) m.setValue(content)
       editor.setModel(m)
     } else {
-      const model = window.monaco.editor.createModel(content, getLanguage(path))
+      const model = monaco.editor.createModel(content, getLanguage(path))
       monacoModels.set(path, model)
       editor.setModel(model)
     }
@@ -268,43 +293,19 @@ async function applyFileChanges(path: string, code: string): Promise<boolean> {
   } catch { return false }
 }
 
-function initMonaco(container: HTMLElement): Promise<any> {
+function initMonaco(container: HTMLElement): Promise<monaco.editor.IStandaloneCodeEditor> {
   return new Promise((resolve) => {
-    window.MonacoEnvironment = {
-      getWorker(_, label) {
-        const fn = (f: string) => new Worker(`${MONACO_CDN}/${f}`)
-        switch (label) {
-          case 'json': return fn('vs/language/json/json.worker.js')
-          case 'css': case 'scss': case 'less': return fn('vs/language/css/css.worker.js')
-          case 'html': case 'handlebars': case 'razor': return fn('vs/language/html/html.worker.js')
-          case 'typescript': case 'javascript': return fn('vs/language/typescript/ts.worker.js')
-          default: return fn('vs/editor/editor.worker.js')
-        }
-      }
-    }
-    const boot = () => {
-      window.require.config({ paths: { vs: MONACO_CDN } })
-      window.require(['vs/editor/editor.main'], () => {
-        const ed = window.monaco.editor.create(container, {
-          value: '', language: 'plaintext', theme: 'vs-dark',
-          automaticLayout: true, minimap: { enabled: false }, fontSize: 14,
-          lineNumbers: 'on', scrollBeyondLastLine: false, tabSize: 2,
-          wordWrap: 'off', padding: { top: 8 },
-          bracketPairColorization: { enabled: true },
-        })
-        ed.onDidChangeModelContent(() => { editorContentVersion++ })
-        ed.addCommand(window.monaco.KeyMod.CtrlCmd | window.monaco.KeyCode.KeyS, async () => { await saveFile() })
-        editor = ed
-        resolve(ed)
-      })
-    }
-    if (window.require != null) boot()
-    else {
-      const s = document.createElement('script')
-      s.src = `${MONACO_CDN}/loader.js`
-      s.onload = boot
-      document.head.appendChild(s)
-    }
+    const ed = monaco.editor.create(container, {
+      value: '', language: 'plaintext', theme: 'vs-dark',
+      automaticLayout: true, minimap: { enabled: false }, fontSize: 14,
+      lineNumbers: 'on', scrollBeyondLastLine: false, tabSize: 2,
+      wordWrap: 'off', padding: { top: 8 },
+      bracketPairColorization: { enabled: true },
+    })
+    ed.onDidChangeModelContent(() => { editorContentVersion++ })
+    ed.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, async () => { await saveFile() })
+    editor = ed
+    resolve(ed)
   })
 }
 

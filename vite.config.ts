@@ -8,4 +8,7 @@ export default defineConfig({
     exclude: ['htm'],
     include: ['ai', '@browser-ai/core', '@browser-ai/web-llm', '@browser-ai/transformers-js', '@huggingface/transformers']
   },
+  worker: {
+    format: 'es'
+  }
 })
