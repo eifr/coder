@@ -3,6 +3,8 @@ import preact from '@preact/preset-vite'
 import tailwindcss from '@tailwindcss/vite'
 import { VitePWA } from 'vite-plugin-pwa'
 
+import { cloudflare } from "@cloudflare/vite-plugin";
+
 export default defineConfig({
   plugins: [preact(), tailwindcss(), VitePWA({
     registerType: 'autoUpdate',
@@ -33,7 +35,7 @@ export default defineConfig({
         options: { cacheName: 'cdn-cache', expiration: { maxEntries: 50, maxAgeSeconds: 86400 * 30 } }
       }]
     }
-  })],
+  }), cloudflare()],
   optimizeDeps: {
     exclude: ['htm'],
     include: ['ai', '@browser-ai/core', '@browser-ai/web-llm', '@browser-ai/transformers-js', '@huggingface/transformers']
