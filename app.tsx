@@ -100,6 +100,7 @@ let editorContentVersion = 0
 let autoSaveTimer: ReturnType<typeof setTimeout> | null = null
 let currentModel: LanguageModel | null = null
 let abortController: AbortController | null = null
+let modelLoadPromise: Promise<LanguageModel> | null = null
 
 async function verifyPermission(fileHandle: FileSystemHandle, readWrite = false): Promise<boolean> {
   const options: FileSystemHandlePermissionDescriptor = {}
@@ -270,8 +271,16 @@ function initMonaco(container: HTMLElement): Promise<any> {
 }
 
 async function initLLM(provider: Provider, modelId: string, onProgress: (p: InitProgressState) => void): Promise<LanguageModel> {
-  currentModel = await initProviderModel(provider, modelId, onProgress)
-  return currentModel
+  if (modelLoadPromise) {
+    return modelLoadPromise
+  }
+  modelLoadPromise = initProviderModel(provider, modelId, onProgress)
+  try {
+    currentModel = await modelLoadPromise
+    return currentModel
+  } finally {
+    modelLoadPromise = null
+  }
 }
 
 function stopGeneration(): void {
@@ -283,17 +292,28 @@ function stopGeneration(): void {
 
 async function* streamChat(messages: ModelMessage[], system?: string): AsyncGenerator<ChatChunk> {
   if (!currentModel) throw new Error('Model not initialized')
-  abortController = new AbortController()
   try {
-    const result = createChatStream({ provider: (currentModel as any).provider || PROVIDERS.WEBLLM, model: currentModel, messages, signal: abortController.signal, system })
+    const result = createChatStream({ provider: (currentModel as any).provider || PROVIDERS.WEBLLM, model: currentModel, messages, system })
     let full = ''
     for await (const chunk of result.textStream) {
+      if (abortController?.signal.aborted) break
       full += chunk
       yield { text: full, done: false, delta: chunk, usage: null }
     }
     yield { text: full, done: true, delta: '', usage: null }
-  } finally {
-    abortController = null
+  } catch (err) {
+    const msg = (err as Error).message || ''
+    if (msg.includes('mapAsync') || msg.includes('Buffer was unmapped')) {
+      console.warn('GPU buffer error, retrying...')
+      await new Promise(r => setTimeout(r, 500))
+      yield { text: '', done: true, delta: '', usage: null }
+      return
+    }
+    if (abortController?.signal.aborted) {
+      yield { text: '', done: true, delta: '', usage: null }
+      return
+    }
+    throw err
   }
 }
 

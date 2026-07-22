@@ -147,13 +147,7 @@ export async function initProviderModel(
           onProgress?.({ text: r.text || `Loading ${modelId}...`, progress: r.progress || 0 })
         },
       })
-      try {
-        await model.createSessionWithProgress((p) => {
-          onProgress?.({ text: `Downloading ${modelId}...`, progress: p })
-        })
-      } catch (e) {
-        console.warn('Pre-download failed, will download on first message:', e)
-      }
+      await new Promise(resolve => setTimeout(resolve, 100))
       return model
     }
     case PROVIDERS.TRANSFORMERS_JS: {
@@ -172,11 +166,10 @@ interface CreateChatStreamOptions {
   provider: Provider
   model: LanguageModel | null
   messages: ModelMessage[]
-  signal?: AbortSignal
   system?: string
 }
 
-export function createChatStream({ provider, model, messages, signal, system }: CreateChatStreamOptions) {
+export function createChatStream({ provider, model, messages, system }: CreateChatStreamOptions) {
   const chatModel = model || (provider === PROVIDERS.BROWSER_AI ? browserAI() : null)
   if (!chatModel) throw new Error(`Model not initialized for provider: ${provider}`)
 
@@ -187,7 +180,6 @@ export function createChatStream({ provider, model, messages, signal, system }: 
     temperature: 0.3,
     maxOutputTokens: 4096,
     topP: 0.95,
-    abortSignal: signal,
     allowSystemInMessages: true,
   })
 }
