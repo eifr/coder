@@ -130,7 +130,10 @@ globalThis.AI_SDK_LOG_WARNINGS = false
 import * as monaco from 'monaco-editor'
 
 self.MonacoEnvironment = {
-  getWorker: () => null as any
+  getWorker() {
+    const blob = new Blob(['self.onmessage = () => {}'], { type: 'application/javascript' })
+    return new Worker(URL.createObjectURL(blob), { type: 'module' })
+  }
 }
 
 monaco.languages.register({ id: 'plaintext' })
