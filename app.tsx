@@ -76,9 +76,11 @@ const SYSTEM_PROMPT = `You are WebCoder, an AI coding assistant running entirely
 
 You have access to tools:
 - readFile(path): Read file contents
-- editFile(path, content): Write content to a file (creates or overwrites)
+- editFile(path, content): Overwrite an existing file's content
+- createFile(path, content): Create a new file (fails if file exists)
+- deleteFile(path): Delete a file
 
-Use readFile to examine files before making changes. Use editFile to directly apply changes to files.
+Use readFile to examine files before making changes. Use createFile for new files and editFile for existing ones. Use deleteFile to remove files.
 
 When suggesting code changes, ALWAYS use a code block with a file path header like this:
 \`\`\`language:path/to/file.js
@@ -358,6 +360,45 @@ async function readFileForTool(path: string): Promise<string | null> {
   } catch {
     return null
   }
+}
+
+async function createFileForTool(path: string, content: string): Promise<boolean> {
+  if (fileHandles.has(path)) return false
+  if (!rootDirHandle) return false
+  const parts = path.split('/')
+  let dirHandle = rootDirHandle
+  for (let i = 0; i < parts.length - 1; i++) {
+    try { dirHandle = await dirHandle.getDirectoryHandle(parts[i], { create: true }) } catch { return false }
+  }
+  try {
+    const fh = await dirHandle.getFileHandle(parts[parts.length - 1], { create: true })
+    await writeFileContent(fh, content)
+    fileHandles.set(path, { handle: fh, name: parts[parts.length - 1], path, type: 'file' })
+    return true
+  } catch { return false }
+}
+
+async function deleteFileForTool(path: string): Promise<boolean> {
+  const entry = fileHandles.get(path)
+  if (!entry) return false
+  try {
+    const parts = path.split('/')
+    let dirHandle = rootDirHandle!
+    for (let i = 0; i < parts.length - 1; i++) {
+      dirHandle = await dirHandle.getDirectoryHandle(parts[i])
+    }
+    await dirHandle.removeEntry(parts[parts.length - 1])
+    fileHandles.delete(path)
+    if (monacoModels.has(path)) {
+      monacoModels.get(path).dispose()
+      monacoModels.delete(path)
+    }
+    if (path === currentFilePath) {
+      currentFilePath = null
+      currentFileHandle = null
+    }
+    return true
+  } catch { return false }
 }
 
 interface SidebarProps {
@@ -674,7 +715,7 @@ function App() {
       { role: 'user', content: text },
     ]
 
-    const tools = attachContext ? createTools(readFileForTool, applyFileChanges) : undefined
+    const tools = attachContext ? createTools(readFileForTool, applyFileChanges, createFileForTool, deleteFileForTool) : undefined
 
     try {
       let full = ''

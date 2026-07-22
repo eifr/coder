@@ -169,7 +169,12 @@ interface CreateChatStreamOptions {
   system?: string
 }
 
-export function createTools(readFileFn: (path: string) => Promise<string | null>, editFileFn: (path: string, content: string) => Promise<boolean>): any {
+export function createTools(
+  readFileFn: (path: string) => Promise<string | null>,
+  editFileFn: (path: string, content: string) => Promise<boolean>,
+  createFileFn: (path: string, content: string) => Promise<boolean>,
+  deleteFileFn: (path: string) => Promise<boolean>
+): any {
   return {
     readFile: {
       description: 'Read the contents of a file in the project',
@@ -186,7 +191,7 @@ export function createTools(readFileFn: (path: string) => Promise<string | null>
       },
     },
     editFile: {
-      description: 'Write content to a file. Creates the file if it does not exist, overwrites if it does.',
+      description: 'Write content to an existing file. Overwrites the entire file.',
       parameters: {
         type: 'object',
         properties: {
@@ -198,6 +203,35 @@ export function createTools(readFileFn: (path: string) => Promise<string | null>
       execute: async ({ path, content }: { path: string; content: string }) => {
         const ok = await editFileFn(path, content)
         return ok ? { path, success: true } : { error: `Failed to write ${path}` }
+      },
+    },
+    createFile: {
+      description: 'Create a new file with the given content. Fails if the file already exists.',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'File path relative to project root' },
+          content: { type: 'string', description: 'File content' },
+        },
+        required: ['path', 'content'],
+      },
+      execute: async ({ path, content }: { path: string; content: string }) => {
+        const ok = await createFileFn(path, content)
+        return ok ? { path, success: true } : { error: `Failed to create ${path} (may already exist)` }
+      },
+    },
+    deleteFile: {
+      description: 'Delete a file from the project',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'File path relative to project root' },
+        },
+        required: ['path'],
+      },
+      execute: async ({ path }: { path: string }) => {
+        const ok = await deleteFileFn(path)
+        return ok ? { path, success: true } : { error: `Failed to delete ${path}` }
       },
     },
   }
