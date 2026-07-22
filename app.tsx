@@ -49,6 +49,38 @@ declare global {
   }
 }
 
+const STORAGE_KEY = 'webcoder-state'
+
+interface PersistedState {
+  selectedProvider: Provider
+  selectedModel: string
+  customModelUrl: string
+  attachContext: boolean
+  messages: Message[]
+}
+
+function loadState(): Partial<PersistedState> {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY)
+    if (!raw) return {}
+    return JSON.parse(raw)
+  } catch {
+    return {}
+  }
+}
+
+function saveState(state: Partial<PersistedState>) {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY)
+    const existing = raw ? JSON.parse(raw) : {}
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ ...existing, ...state }))
+  } catch {}
+}
+
+function clearState() {
+  try { localStorage.removeItem(STORAGE_KEY) } catch {}
+}
+
 const EXCLUDED = new Set(['node_modules','.git','dist','.DS_Store','__pycache__','.next','.vscode','build','.cache','.venv','venv','env','.idea','coverage','.nyc_output'])
 const MAX_DEPTH = 8
 const MAX_CONTEXT_FILES = 8
@@ -623,26 +655,31 @@ function ChatPanel({ messages, streamingContent, codeBlocks, isGenerating, onSen
 }
 
 function App() {
+  const saved = loadState()
   const [treeData, setTreeData] = useState<FileEntry[] | null>(null)
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(new Set())
   const [selectedFile, setSelectedFile] = useState<string | null>(null)
-  const [selectedProvider, setSelectedProvider] = useState<Provider>(PROVIDERS.WEBLLM)
+  const [selectedProvider, setSelectedProvider] = useState<Provider>((saved.selectedProvider as Provider) || PROVIDERS.WEBLLM)
   const [modelList, setModelList] = useState<ModelDescriptor[]>([])
-  const [selectedModel, setSelectedModel] = useState('')
+  const [selectedModel, setSelectedModel] = useState(saved.selectedModel || '')
   const [modelLoaded, setModelLoaded] = useState(false)
   const [modelLoading, setModelLoading] = useState(false)
   const [initProgress, setInitProgress] = useState<InitProgressState | null>(null)
-  const [messages, setMessages] = useState<Message[]>([])
+  const [messages, setMessages] = useState<Message[]>(saved.messages || [])
   const [streamingContent, setStreamingContent] = useState('')
   const [isGenerating, setIsGenerating] = useState(false)
   const [codeBlocks, setCodeBlocks] = useState<CodeBlock[]>([])
-  const [attachContext, setAttachContext] = useState(true)
-  const [customModelUrl, setCustomModelUrl] = useState('')
+  const [attachContext, setAttachContext] = useState(saved.attachContext ?? true)
+  const [customModelUrl, setCustomModelUrl] = useState(saved.customModelUrl || '')
   const [fileStatus, setFileStatus] = useState('')
 
   const editorRef = useRef<HTMLDivElement | null>(null)
   const abortRef = useRef(false)
   const generatingRef = useRef(false)
+
+  useEffect(() => {
+    saveState({ selectedProvider, selectedModel, customModelUrl, attachContext, messages })
+  }, [selectedProvider, selectedModel, customModelUrl, attachContext, messages])
 
   useEffect(() => {
     (async () => {
@@ -653,10 +690,12 @@ function App() {
           models = models.filter(m => m.provider !== PROVIDERS.BROWSER_AI)
         }
         setModelList(models)
-        const preferred = getPreferredModel(models)
-        if (preferred) {
-          setSelectedModel(preferred.id)
-          setSelectedProvider(preferred.provider)
+        if (!saved.selectedModel) {
+          const preferred = getPreferredModel(models)
+          if (preferred) {
+            setSelectedModel(preferred.id)
+            setSelectedProvider(preferred.provider)
+          }
         }
       } catch {
         const fallback: ModelDescriptor[] = [
@@ -665,8 +704,10 @@ function App() {
           { id: 'Qwen2.5-Coder-7B-Instruct-q4f16_1-MLC', vram: 8192, provider: PROVIDERS.WEBLLM },
         ]
         setModelList(fallback)
-        setSelectedModel(fallback[0].id)
-        setSelectedProvider(PROVIDERS.WEBLLM)
+        if (!saved.selectedModel) {
+          setSelectedModel(fallback[0].id)
+          setSelectedProvider(PROVIDERS.WEBLLM)
+        }
       }
     })()
   }, [])
@@ -742,7 +783,7 @@ function App() {
   }, [messages, modelLoaded, currentModel, attachContext, treeData])
 
   const handleStop = useCallback(() => { abortRef.current = true; stopGeneration() }, [])
-  const handleClear = useCallback(() => { setMessages([]); setStreamingContent(''); setCodeBlocks([]) }, [])
+  const handleClear = useCallback(() => { setMessages([]); setStreamingContent(''); setCodeBlocks([]); saveState({ messages: [] }) }, [])
 
   const handleApply = useCallback(async (path: string, code: string) => {
     const ok = await applyFileChanges(path, code)
