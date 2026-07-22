@@ -1,0 +1,29 @@
+{
+  "name": "web-coder",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@browser-ai/core": "^2.1.13",
+    "@browser-ai/transformers-js": "^2.2.2",
+    "@browser-ai/web-llm": "^2.0.0",
+    "@huggingface/transformers": "^3.7.0",
+    "@mlc-ai/web-llm": "^0.2.84",
+    "@preact/preset-vite": "^2.10.6",
+    "ai": "^6.0.0",
+    "htm": "^3.1.1",
+    "preact": "^10.26.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.0.0",
+    "@types/react": "^19.2.17",
+    "@webgpu/types": "^0.1.71",
+    "tailwindcss": "^4.0.0",
+    "typescript": "^7.0.2",
+    "vite": "^6.0.0"
+  }
+}
