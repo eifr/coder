@@ -2,6 +2,10 @@ import { html, render, useState, useEffect, useRef, useCallback, useMemo } from 
 import { PROVIDERS, getAvailableModels, estimateVRAM, getPreferredModel, checkProviderAvailability, initProviderModel, createChatStream, createTools, type Provider, type ModelDescriptor } from './llm-provider'
 import type { LanguageModel, ModelMessage } from 'ai'
 
+globalThis.AI_SDK_LOG_WARNINGS = false
+
+globalThis.AI_SDK_LOG_WARNINGS = false
+
 interface FileEntry {
   name: string
   path: string
@@ -85,6 +89,15 @@ const EXCLUDED = new Set(['node_modules','.git','dist','.DS_Store','__pycache__'
 const MAX_DEPTH = 8
 const MAX_CONTEXT_FILES = 8
 const MAX_CONTEXT_FILE_SIZE = 1500
+// Suppress AI SDK warnings (toolChoice not supported by WebLLM is expected)
+globalThis.AI_SDK_LOG_WARNINGS = false
+
+// Suppress AI SDK warnings (toolChoice not supported by WebLLM is expected)
+globalThis.AI_SDK_LOG_WARNINGS = false
+
+// Suppress AI SDK warnings (toolChoice not supported by WebLLM is expected)
+globalThis.AI_SDK_LOG_WARNINGS = false
+
 import * as monaco from 'monaco-editor'
 
 self.MonacoEnvironment = {
