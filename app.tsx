@@ -382,9 +382,11 @@ async function* streamChat(messages: ModelMessage[], system?: string, tools?: Re
     for await (const chunk of result.textStream) {
       if (abortController?.signal.aborted) break
       full += chunk
-      yield { text: full, done: false, delta: chunk, usage: null }
+      const cleaned = full.replace(/<think>[\s\S]*?<\/think>/g, '').trim()
+      yield { text: cleaned, done: false, delta: chunk, usage: null }
     }
-    yield { text: full, done: true, delta: '', usage: null }
+    const cleaned = full.replace(/<think>[\s\S]*?<\/think>/g, '').trim()
+    yield { text: cleaned, done: true, delta: '', usage: null }
   } catch (err) {
     const msg = (err as Error).message || ''
     if (msg.includes('mapAsync') || msg.includes('Buffer was unmapped')) {
@@ -812,7 +814,7 @@ function App() {
       { role: 'user', content: text },
     ]
 
-    const tools = attachContext && (currentModel as any).provider !== PROVIDERS.WEBLLM ? createTools(readFileForTool, applyFileChanges, createFileForTool, deleteFileForTool) : undefined
+    const tools = attachContext ? createTools(readFileForTool, applyFileChanges, createFileForTool, deleteFileForTool) : undefined
 
     try {
       let full = ''
