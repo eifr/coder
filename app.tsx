@@ -449,19 +449,99 @@ function getLanguage(filePath: string): string {
   return LANG_MAP[ext] || 'plaintext'
 }
 
+const WORKSPACE_DB = 'coder-workspace'
+const WORKSPACE_STORE = 'workspace'
+const WORKSPACE_KEY = 'root'
+
+/**
+ * `FileSystemDirectoryHandle`s are structured-cloneable, so IndexedDB can keep
+ * the last project across reloads. Permission itself is not persisted: Chrome
+ * may require a click to re-grant it, which the sidebar prompts for.
+ */
+function openWorkspaceDb(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(WORKSPACE_DB, 1)
+    request.onupgradeneeded = () => {
+      if (!request.result.objectStoreNames.contains(WORKSPACE_STORE)) {
+        request.result.createObjectStore(WORKSPACE_STORE)
+      }
+    }
+    request.onsuccess = () => resolve(request.result)
+    request.onerror = () => reject(request.error)
+  })
+}
+
+async function storeRootHandle(handle: FileSystemDirectoryHandle): Promise<void> {
+  try {
+    const db = await openWorkspaceDb()
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(WORKSPACE_STORE, 'readwrite')
+      tx.objectStore(WORKSPACE_STORE).put(handle, WORKSPACE_KEY)
+      tx.oncomplete = () => resolve()
+      tx.onerror = () => reject(tx.error)
+      tx.onabort = () => reject(tx.error)
+    })
+    db.close()
+  } catch (err) {
+    console.warn('storeRootHandle:', err)
+  }
+}
+
+async function readStoredRootHandle(): Promise<FileSystemDirectoryHandle | null> {
+  try {
+    const db = await openWorkspaceDb()
+    const handle = await new Promise<FileSystemDirectoryHandle | null>((resolve, reject) => {
+      const tx = db.transaction(WORKSPACE_STORE, 'readonly')
+      const request = tx.objectStore(WORKSPACE_STORE).get(WORKSPACE_KEY)
+      request.onsuccess = () => resolve((request.result as FileSystemDirectoryHandle | undefined) ?? null)
+      request.onerror = () => reject(request.error)
+    })
+    db.close()
+    return handle
+  } catch (err) {
+    console.warn('readStoredRootHandle:', err)
+    return null
+  }
+}
+
+async function clearStoredRootHandle(): Promise<void> {
+  try {
+    const db = await openWorkspaceDb()
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(WORKSPACE_STORE, 'readwrite')
+      tx.objectStore(WORKSPACE_STORE).delete(WORKSPACE_KEY)
+      tx.oncomplete = () => resolve()
+      tx.onerror = () => reject(tx.error)
+      tx.onabort = () => reject(tx.error)
+    })
+    db.close()
+  } catch (err) {
+    console.warn('clearStoredRootHandle:', err)
+  }
+}
+
+async function activateFolder(
+  handle: FileSystemDirectoryHandle,
+  onIndexProgress?: (indexedFiles: number) => void
+): Promise<FileEntry[] | null> {
+  const generation = ++folderGeneration
+  rootDirHandle = handle
+  rootDirName = handle.name
+  fileHandles.clear()
+  loadingDirs.clear()
+  // Render only the top level immediately; nested directories load on
+  // expand, while a background index feeds the AI tools.
+  const entries = await readDirEntries(handle)
+  if (generation !== folderGeneration) return null
+  indexPromise = indexFolder(handle, generation, onIndexProgress)
+  return entries
+}
+
 async function openFolder(onIndexProgress?: (indexedFiles: number) => void): Promise<FileEntry[] | null> {
   try {
     const handle = await (window as any).showDirectoryPicker()
-    const generation = ++folderGeneration
-    rootDirHandle = handle
-    rootDirName = handle.name
-    fileHandles.clear()
-    loadingDirs.clear()
-    // Render only the top level immediately; nested directories load on
-    // expand, while a background index feeds the AI tools.
-    const entries = await readDirEntries(handle)
-    if (generation !== folderGeneration) return null
-    indexPromise = indexFolder(handle, generation, onIndexProgress)
+    const entries = await activateFolder(handle, onIndexProgress)
+    if (entries) void storeRootHandle(handle)
     return entries
   } catch (err) {
     if ((err as Error).name !== 'AbortError' && (err as Error).name !== 'SecurityError') throw err
@@ -960,10 +1040,12 @@ interface SidebarProps {
   onProviderChange: (provider: Provider) => void
   modelAreaHidden: boolean
   onToggleModelArea: () => void
+  restorableProject: string | null
+  onRestoreProject: () => void
   onShowBuiltInAI: () => void
 }
 
-function Sidebar({ treeData, indexedCount, expandedPaths, onToggleDir, onFileClick, selectedFile, modelList, selectedModel, onModelChange, modelLoaded, modelLoading, initProgress, onLoadModel, onOpenFolder, attachContext, onAttachContextChange, customModelUrl, onCustomModel, selectedProvider, onProviderChange, modelAreaHidden, onToggleModelArea, onShowBuiltInAI }: SidebarProps) {
+function Sidebar({ treeData, indexedCount, expandedPaths, onToggleDir, onFileClick, selectedFile, modelList, selectedModel, onModelChange, modelLoaded, modelLoading, initProgress, onLoadModel, onOpenFolder, attachContext, onAttachContextChange, customModelUrl, onCustomModel, selectedProvider, onProviderChange, modelAreaHidden, onToggleModelArea, restorableProject, onRestoreProject, onShowBuiltInAI }: SidebarProps) {
   const visibleCount = useMemo(() => {
     if (!treeData) return 0
     let n = 0
@@ -985,6 +1067,12 @@ function Sidebar({ treeData, indexedCount, expandedPaths, onToggleDir, onFileCli
           <${FolderPlusIcon} class="w-3.5 h-3.5 text-muted" />
           <span>${treeData ? 'Change folder' : 'Open folder'}</span>
         </button>
+        ${!treeData && restorableProject ? html`
+          <button class="w-full px-3 py-1.5 bg-accent/10 hover:bg-accent/15 text-accent text-[11.5px] rounded-md border border-accent/30 flex items-center justify-center gap-1.5 transition-colors" onClick=${onRestoreProject} title="Reopen the last project">
+            <${FolderIcon} class="w-3.5 h-3.5" />
+            <span class="truncate">Reopen ${restorableProject}</span>
+          </button>
+        ` : ''}
       </div>
       <div class="flex-1 overflow-y-auto py-1.5">
         ${treeData ? html`<${FileTree} entries=${treeData} expandedPaths=${expandedPaths} onToggle=${onToggleDir} onFileClick=${onFileClick} selectedFile=${selectedFile} depth=${0} />`
@@ -1823,6 +1911,7 @@ function BuiltInTaskDialog({ request, onClose, onReplace }: { request: BuiltInAc
 function App() {
   const saved = loadState()
   const [treeData, setTreeData] = useState<FileEntry[] | null>(null)
+  const [restorableProject, setRestorableProject] = useState<string | null>(null)
   const [indexedCount, setIndexedCount] = useState(0)
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(new Set())
   const [selectedFile, setSelectedFile] = useState<string | null>(null)
@@ -1967,10 +2056,7 @@ function App() {
     initMonaco(editorRef.current!).then(() => {})
   }, [])
 
-  const handleOpenFolder = useCallback(async () => {
-    if (dirtyFiles.size > 0 && !window.confirm('Change folder? Unsaved changes will be discarded.')) return
-    const entries = await openFolder(setIndexedCount)
-    if (!entries) return
+  const applyFolder = useCallback((entries: FileEntry[]) => {
     setMobilePanel(null)
     setIndexedCount(fileHandles.size)
     editor?.setModel(null)
@@ -1985,7 +2071,61 @@ function App() {
     currentFilePath = null
     currentFileHandle = null
     setSavedFile('')
-  }, [dirtyFiles])
+    setRestorableProject(null)
+  }, [])
+
+  const handleOpenFolder = useCallback(async () => {
+    if (dirtyFiles.size > 0 && !window.confirm('Change folder? Unsaved changes will be discarded.')) return
+    const entries = await openFolder(setIndexedCount)
+    if (entries) applyFolder(entries)
+  }, [dirtyFiles, applyFolder])
+
+  // Restore the last project without a picker. Reloads keep an already granted
+  // permission; after a browser restart Chrome reports "prompt", which needs a
+  // click, so offer a button instead of failing silently.
+  useEffect(() => {
+    let alive = true
+    ;(async () => {
+      const handle = await readStoredRootHandle()
+      if (!handle || !alive) return
+      try {
+        const permission = await handle.queryPermission({ mode: 'readwrite' })
+        if (permission === 'granted') {
+          const entries = await activateFolder(handle, setIndexedCount)
+          if (entries && alive) applyFolder(entries)
+        } else if (permission === 'prompt') {
+          setRestorableProject(handle.name)
+        } else {
+          void clearStoredRootHandle()
+        }
+      } catch (err) {
+        console.warn('restore folder:', err)
+        void clearStoredRootHandle()
+      }
+    })()
+    return () => { alive = false }
+  }, [applyFolder])
+
+  const handleRestoreProject = useCallback(async () => {
+    const handle = await readStoredRootHandle()
+    if (!handle) {
+      setRestorableProject(null)
+      return
+    }
+    try {
+      if (!await verifyPermission(handle, true)) {
+        addNotification('Permission to reopen the project was denied.', 'warning')
+        return
+      }
+      const entries = await activateFolder(handle, setIndexedCount)
+      if (entries) applyFolder(entries)
+    } catch (err) {
+      console.error('restore folder:', err)
+      addNotification(`Could not reopen ${handle.name}.`, 'error')
+      void clearStoredRootHandle()
+      setRestorableProject(null)
+    }
+  }, [applyFolder])
 
   const handleToggleDir = useCallback((entry: FileEntry) => {
     const path = entry.path
@@ -2255,7 +2395,7 @@ function App() {
     } finally { setModelLoading(false) }
   }, [selectedModel, selectedProvider, customModelUrl])
 
-  const sidebarProps: SidebarProps = { treeData, indexedCount, expandedPaths, onToggleDir: handleToggleDir, onFileClick: handleFileClick, selectedFile, modelList, selectedModel, onModelChange: m => { setSelectedModel(m); setModelLoaded(false) }, modelLoaded, modelLoading, initProgress, onLoadModel: handleLoadModel, onOpenFolder: handleOpenFolder, attachContext, onAttachContextChange: setAttachContext, customModelUrl, onCustomModel: setCustomModelUrl, selectedProvider, onProviderChange: p => { if (p === PROVIDERS.BROWSER_AI && !window.__browserAiAvailable) return; setSelectedProvider(p); setSelectedModel(''); setModelLoaded(false); const models = getAvailableModels(4096); const first = models.find(m => m.provider === p); if (first) setSelectedModel(first.id) }, modelAreaHidden, onToggleModelArea: () => setModelAreaHidden(v => !v), onShowBuiltInAI: () => setShowBuiltInAI(true) }
+  const sidebarProps: SidebarProps = { treeData, indexedCount, expandedPaths, onToggleDir: handleToggleDir, onFileClick: handleFileClick, selectedFile, modelList, selectedModel, onModelChange: m => { setSelectedModel(m); setModelLoaded(false) }, modelLoaded, modelLoading, initProgress, onLoadModel: handleLoadModel, onOpenFolder: handleOpenFolder, attachContext, onAttachContextChange: setAttachContext, customModelUrl, onCustomModel: setCustomModelUrl, selectedProvider, onProviderChange: p => { if (p === PROVIDERS.BROWSER_AI && !window.__browserAiAvailable) return; setSelectedProvider(p); setSelectedModel(''); setModelLoaded(false); const models = getAvailableModels(4096); const first = models.find(m => m.provider === p); if (first) setSelectedModel(first.id) }, modelAreaHidden, onToggleModelArea: () => setModelAreaHidden(v => !v), restorableProject, onRestoreProject: handleRestoreProject, onShowBuiltInAI: () => setShowBuiltInAI(true) }
 
   const chatProps: ChatPanelProps = { messages, streamingContent, codeBlocks, isGenerating, generationStatus, onSend: handleSend, onStop: handleStop, onApply: handleApply, onClear: handleClear, onExport: handleExportChat, modelLoaded, draft: chatDraft, onDraftConsumed: consumeChatDraft }
   const quickFiles = useMemo(() => quickOpen ? [...fileHandles.keys()].sort() : [], [quickOpen, indexedCount])
