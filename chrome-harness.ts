@@ -26,6 +26,7 @@ export interface HarnessTool {
 }
 
 export type ChromeHarnessEvent =
+  | { type: 'status'; text: string }
   | { type: 'text'; text: string; delta: string }
   | { type: 'tool-call'; name: string; args: Record<string, unknown> }
   | { type: 'tool-result'; name: string; ok: boolean; preview: string }
@@ -62,6 +63,15 @@ interface NativeContent {
 interface PromptSession {
   promptStreaming(input: unknown, options?: { signal: AbortSignal }): AsyncIterable<unknown>
   destroy?: () => void
+}
+
+interface DownloadProgressEvent {
+  loaded: number
+  total?: number
+}
+
+interface DownloadMonitor {
+  addEventListener(type: 'downloadprogress', listener: (event: DownloadProgressEvent) => void): void
 }
 
 interface LanguageModelGlobal {
@@ -151,6 +161,85 @@ function createSessionOptions(
   return options
 }
 
+interface StatusChannel {
+  push(text: string): void
+  close(): void
+  next(): Promise<string | null>
+}
+
+/**
+ * Bridges `monitor` callbacks (fired while `LanguageModel.create` is pending)
+ * to an async generator, so callers can render a loading state during the
+ * wait — including the multi-gigabyte on-device model download.
+ */
+function createStatusChannel(): StatusChannel {
+  const buffered: string[] = []
+  let wake: ((value: string | null) => void) | null = null
+  let closed = false
+  return {
+    push(text) {
+      if (closed) return
+      if (wake) {
+        const resolve = wake
+        wake = null
+        resolve(text)
+      } else {
+        buffered.push(text)
+      }
+    },
+    close() {
+      closed = true
+      if (wake) {
+        const resolve = wake
+        wake = null
+        resolve(null)
+      }
+    },
+    next() {
+      const text = buffered.shift()
+      if (text !== undefined) return Promise.resolve(text)
+      if (closed) return Promise.resolve(null)
+      return new Promise(resolve => { wake = resolve })
+    },
+  }
+}
+
+/**
+ * Creates a session while yielding `status` events: one while Chrome prepares
+ * the model, then download progress reported through the Prompt API `monitor`.
+ */
+async function* createSession(
+  model: LanguageModelGlobal,
+  options: Record<string, unknown>
+): AsyncGenerator<ChromeHarnessEvent, PromptSession> {
+  const status = createStatusChannel()
+  let lastPercent = -1
+  options.monitor = (monitor: DownloadMonitor) => {
+    monitor.addEventListener('downloadprogress', event => {
+      const total = typeof event.total === 'number' && event.total > 0 ? event.total : 0
+      const percent = total > 0 ? Math.round((event.loaded / total) * 100) : -1
+      if (percent === lastPercent) return
+      lastPercent = percent
+      status.push(percent >= 0
+        ? `Downloading the on-device model… ${percent}%`
+        : 'Downloading the on-device model…')
+    })
+  }
+  yield { type: 'status', text: 'Preparing the on-device model…' }
+  const creating = model.create(options).then(
+    session => ({ ok: true as const, session }),
+    (error: unknown) => ({ ok: false as const, error })
+  ).finally(() => status.close())
+  while (true) {
+    const text = await status.next()
+    if (text === null) break
+    yield { type: 'status', text }
+  }
+  const outcome = await creating
+  if (!outcome.ok) throw outcome.error
+  return outcome.session
+}
+
 function makeToolResponse(call: NativeToolCall, ok: boolean, text: string): unknown {
   const globals = globalThis as Record<string, unknown>
   const Success = globals.LanguageModelToolSuccess as ToolResponseConstructor | undefined
@@ -183,7 +272,7 @@ export async function* streamChromeHarness(options: ChromeHarnessOptions): Async
 
   if (tools.length > 0) {
     try {
-      session = await LanguageModel.create(createSessionOptions(system, tools, options.signal))
+      session = yield* createSession(LanguageModel, createSessionOptions(system, tools, options.signal))
     } catch (err) {
       // Older Chrome builds expose the Prompt API but not tool use. Retry as a
       // plain text session so the chat still works (without project access).
@@ -191,10 +280,10 @@ export async function* streamChromeHarness(options: ChromeHarnessOptions): Async
       tools = []
       system = options.plainSystem
       yield { type: 'fallback', reason }
-      session = await LanguageModel.create(createSessionOptions(system, tools, options.signal))
+      session = yield* createSession(LanguageModel, createSessionOptions(system, tools, options.signal))
     }
   } else {
-    session = await LanguageModel.create(createSessionOptions(system, tools, options.signal))
+    session = yield* createSession(LanguageModel, createSessionOptions(system, tools, options.signal))
   }
 
   const messages = toNativeMessages(options.messages)

@@ -1,5 +1,5 @@
 import { html, render, Component, useState, useEffect, useRef, useCallback, useMemo } from 'htm/preact/standalone.mjs'
-import { PROVIDERS, getAvailableModels, estimateVRAM, getPreferredModel, checkProviderAvailability, getBrowserAIStatus, getBuiltInAICapabilities, initProviderModel, createChatStream, createTools, type Provider, type ModelDescriptor, type BuiltInApiInfo, type BuiltInApiStatus } from './llm-provider'
+import { PROVIDERS, getAvailableModels, estimateVRAM, getPreferredModel, checkProviderAvailability, getBrowserAIStatus, getBuiltInAICapabilities, getProviderLabel, initProviderModel, createChatStream, createTools, type Provider, type ModelDescriptor, type BuiltInApiInfo, type BuiltInApiStatus } from './llm-provider'
 import { createHarnessTools, streamChromeHarness, type HarnessTool } from './chrome-harness'
 import type { LanguageModel, ModelMessage } from 'ai'
 
@@ -70,6 +70,8 @@ interface ChatChunk {
   done: boolean
   delta: string
   usage: unknown
+  /** Human-readable loading state, e.g. while the on-device model prepares. */
+  status?: string
   tool?: { name: string; path?: string; ok?: boolean }
 }
 
@@ -96,6 +98,7 @@ interface PersistedState {
   selectedModel: string
   customModelUrl: string
   attachContext: boolean
+  modelAreaHidden: boolean
   messages: Message[]
 }
 
@@ -683,7 +686,9 @@ async function* streamChat(messages: ModelMessage[], system?: string, plainSyste
       signal,
     })) {
       if (signal?.aborted) break
-      if (event.type === 'text') {
+      if (event.type === 'status') {
+        yield { text: visible, done: false, delta: '', usage: null, status: event.text }
+      } else if (event.type === 'text') {
         visible = event.text
         yield { text: event.text, done: false, delta: event.delta, usage: null }
       } else if (event.type === 'tool-call') {
@@ -923,10 +928,12 @@ interface SidebarProps {
   onCustomModel: (url: string) => void
   selectedProvider: Provider
   onProviderChange: (provider: Provider) => void
+  modelAreaHidden: boolean
+  onToggleModelArea: () => void
   onShowBuiltInAI: () => void
 }
 
-function Sidebar({ treeData, indexedCount, expandedPaths, onToggleDir, onFileClick, selectedFile, modelList, selectedModel, onModelChange, modelLoaded, modelLoading, initProgress, onLoadModel, onOpenFolder, attachContext, onAttachContextChange, customModelUrl, onCustomModel, selectedProvider, onProviderChange, onShowBuiltInAI }: SidebarProps) {
+function Sidebar({ treeData, indexedCount, expandedPaths, onToggleDir, onFileClick, selectedFile, modelList, selectedModel, onModelChange, modelLoaded, modelLoading, initProgress, onLoadModel, onOpenFolder, attachContext, onAttachContextChange, customModelUrl, onCustomModel, selectedProvider, onProviderChange, modelAreaHidden, onToggleModelArea, onShowBuiltInAI }: SidebarProps) {
   const visibleCount = useMemo(() => {
     if (!treeData) return 0
     let n = 0
@@ -934,6 +941,7 @@ function Sidebar({ treeData, indexedCount, expandedPaths, onToggleDir, onFileCli
     w(treeData)
     return n
   }, [treeData])
+  const modelLabel = modelList.find(m => m.id === selectedModel)?.label || selectedModel
 
   return html`
     <div class="flex flex-col h-full">
@@ -957,39 +965,49 @@ function Sidebar({ treeData, indexedCount, expandedPaths, onToggleDir, onFileCli
           </div>`}
       </div>
       <div class="p-3 border-t border-line space-y-2.5">
-        <div class="text-[10px] font-semibold uppercase tracking-[0.16em] text-faint">Model</div>
-        <label class="block space-y-1">
-          <span class="text-[10px] text-faint">Provider</span>
-          <select class="w-full bg-raised text-ink text-[11.5px] rounded-md px-2.5 py-1.5 border border-line outline-none focus:border-accent/70 disabled:opacity-50" value=${selectedProvider} onChange=${(e: Event) => onProviderChange((e.target as HTMLSelectElement).value as Provider)} disabled=${modelLoading}>
-            ${window.__gpuAvailable ? html`<option value=${PROVIDERS.WEBLLM}>WebLLM</option>` : ''}
-            ${window.__transformersAvailable ? html`<option value=${PROVIDERS.TRANSFORMERS_JS}>Transformers.js</option>` : ''}
-            ${window.__browserAiAvailable ? html`<option value=${PROVIDERS.BROWSER_AI}>Chrome Built-in AI</option>` : html`<option disabled>${window.__browserAiNote || 'Chrome AI (not available)'}</option>`}
-          </select>
-        </label>
-        <button class="w-full flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-md border border-line bg-raised hover:bg-hover text-[10.5px] text-muted hover:text-ink transition-colors" onClick=${onShowBuiltInAI}>
-          <span class="flex items-center gap-1.5"><${SparkIcon} />Built-in AI APIs</span>
-          <span class="text-faint">›</span>
-        </button>
-        <label class="block space-y-1">
-          <span class="text-[10px] text-faint">Model</span>
-          <select class="w-full bg-raised text-ink text-[11.5px] rounded-md px-2.5 py-1.5 border border-line outline-none focus:border-accent/70 disabled:opacity-50" value=${selectedModel} onChange=${(e: Event) => onModelChange((e.target as HTMLSelectElement).value)} disabled=${modelLoading}>
-            ${modelList.filter(m => m.provider === selectedProvider).map(m => html`<option value=${m.id}>${m.label || m.id}${m.vram ? ' · '+m.vram+'MB' : ''}</option>`)}
-          </select>
-        </label>
-        <input type="text" class="w-full bg-raised text-ink text-[11.5px] rounded-md px-2.5 py-1.5 border border-line outline-none focus:border-accent/70 placeholder:text-faint" placeholder="Custom model ID or URL" value=${customModelUrl} onInput=${(e: Event) => onCustomModel((e.target as HTMLInputElement).value)} />
-        ${initProgress ? html`
-          <div class="space-y-1.5">
-            <div class="flex justify-between gap-2 text-[10.5px] text-muted"><span class="line-clamp-3 leading-snug">${initProgress.text}</span><span class="font-mono shrink-0">${Math.round(initProgress.progress * 100)}%</span></div>
-            <div class="h-1 bg-raised rounded-full overflow-hidden"><div class="h-full bg-accent rounded-full transition-all duration-300" style=${{ width: `${initProgress.progress * 100}%` }}></div></div>
-          </div>
-        ` : ''}
-        <button class="w-full px-3 py-1.5 text-[11.5px] rounded-md transition-colors flex items-center justify-center gap-1.5 ${modelLoaded ? 'border border-ok/40 bg-ok/10 text-ok' : modelLoading ? 'bg-raised text-muted border border-line cursor-not-allowed' : 'bg-accent hover:bg-accent-strong text-accent-ink font-medium'}" onClick=${onLoadModel} disabled=${modelLoading}>
-          ${modelLoaded ? html`<${CheckIcon} /><span>Model ready</span>` : modelLoading ? 'Loading…' : 'Load model'}
-        </button>
-        <label class="flex items-start gap-2 text-[11px] text-muted cursor-pointer leading-snug">
-          <input type="checkbox" checked=${attachContext} onChange=${(e: Event) => onAttachContextChange((e.target as HTMLInputElement).checked)} class="accent-accent mt-0.5" />
-          <span>Attach project context</span>
-        </label>
+        <div class="flex items-center justify-between">
+          <span class="text-[10px] font-semibold uppercase tracking-[0.16em] text-faint">Model</span>
+          <button class="text-[10px] text-faint hover:text-ink transition-colors" onClick=${onToggleModelArea} aria-expanded=${!modelAreaHidden}>${modelAreaHidden ? 'Show' : 'Hide'}</button>
+        </div>
+        ${modelAreaHidden ? html`
+          <button class="w-full text-left space-y-0.5" onClick=${onToggleModelArea} aria-label="Show model settings">
+            <span class="block text-[11px] text-muted truncate">${getProviderLabel(selectedProvider)}</span>
+            <span class="block text-[10px] text-faint truncate">${modelLoaded ? (modelLabel === getProviderLabel(selectedProvider) ? 'Loaded' : modelLabel) : 'Not loaded'}</span>
+          </button>
+        ` : html`
+          <label class="block space-y-1">
+            <span class="text-[10px] text-faint">Provider</span>
+            <select class="w-full bg-raised text-ink text-[11.5px] rounded-md px-2.5 py-1.5 border border-line outline-none focus:border-accent/70 disabled:opacity-50" value=${selectedProvider} onChange=${(e: Event) => onProviderChange((e.target as HTMLSelectElement).value as Provider)} disabled=${modelLoading}>
+              ${window.__gpuAvailable ? html`<option value=${PROVIDERS.WEBLLM}>WebLLM</option>` : ''}
+              ${window.__transformersAvailable ? html`<option value=${PROVIDERS.TRANSFORMERS_JS}>Transformers.js</option>` : ''}
+              ${window.__browserAiAvailable ? html`<option value=${PROVIDERS.BROWSER_AI}>Chrome Built-in AI</option>` : html`<option disabled>${window.__browserAiNote || 'Chrome AI (not available)'}</option>`}
+            </select>
+          </label>
+          <button class="w-full flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-md border border-line bg-raised hover:bg-hover text-[10.5px] text-muted hover:text-ink transition-colors" onClick=${onShowBuiltInAI}>
+            <span class="flex items-center gap-1.5"><${SparkIcon} />Built-in AI APIs</span>
+            <span class="text-faint">›</span>
+          </button>
+          <label class="block space-y-1">
+            <span class="text-[10px] text-faint">Model</span>
+            <select class="w-full bg-raised text-ink text-[11.5px] rounded-md px-2.5 py-1.5 border border-line outline-none focus:border-accent/70 disabled:opacity-50" value=${selectedModel} onChange=${(e: Event) => onModelChange((e.target as HTMLSelectElement).value)} disabled=${modelLoading}>
+              ${modelList.filter(m => m.provider === selectedProvider).map(m => html`<option value=${m.id}>${m.label || m.id}${m.vram ? ' · '+m.vram+'MB' : ''}</option>`)}
+            </select>
+          </label>
+          <input type="text" class="w-full bg-raised text-ink text-[11.5px] rounded-md px-2.5 py-1.5 border border-line outline-none focus:border-accent/70 placeholder:text-faint" placeholder="Custom model ID or URL" value=${customModelUrl} onInput=${(e: Event) => onCustomModel((e.target as HTMLInputElement).value)} />
+          ${initProgress ? html`
+            <div class="space-y-1.5">
+              <div class="flex justify-between gap-2 text-[10.5px] text-muted"><span class="line-clamp-3 leading-snug">${initProgress.text}</span><span class="font-mono shrink-0">${Math.round(initProgress.progress * 100)}%</span></div>
+              <div class="h-1 bg-raised rounded-full overflow-hidden"><div class="h-full bg-accent rounded-full transition-all duration-300" style=${{ width: `${initProgress.progress * 100}%` }}></div></div>
+            </div>
+          ` : ''}
+          <button class="w-full px-3 py-1.5 text-[11.5px] rounded-md transition-colors flex items-center justify-center gap-1.5 ${modelLoaded ? 'border border-ok/40 bg-ok/10 text-ok' : modelLoading ? 'bg-raised text-muted border border-line cursor-not-allowed' : 'bg-accent hover:bg-accent-strong text-accent-ink font-medium'}" onClick=${onLoadModel} disabled=${modelLoading}>
+            ${modelLoaded ? html`<${CheckIcon} /><span>Model ready</span>` : modelLoading ? 'Loading…' : 'Load model'}
+          </button>
+          <label class="flex items-start gap-2 text-[11px] text-muted cursor-pointer leading-snug">
+            <input type="checkbox" checked=${attachContext} onChange=${(e: Event) => onAttachContextChange((e.target as HTMLInputElement).checked)} class="accent-accent mt-0.5" />
+            <span>Attach project context</span>
+          </label>
+        `}
       </div>
     </div>
   `
@@ -1082,6 +1100,7 @@ interface ChatPanelProps {
   streamingContent: string
   codeBlocks: CodeBlock[]
   isGenerating: boolean
+  generationStatus: string
   onSend: (text: string) => void
   onStop: () => void
   onApply: (path: string, code: string) => void
@@ -1092,7 +1111,7 @@ interface ChatPanelProps {
   onDraftConsumed: () => void
 }
 
-function ChatPanel({ messages, streamingContent, codeBlocks, isGenerating, onSend, onStop, onApply, onClear, onExport, modelLoaded, draft, onDraftConsumed }: ChatPanelProps) {
+function ChatPanel({ messages, streamingContent, codeBlocks, isGenerating, generationStatus, onSend, onStop, onApply, onClear, onExport, modelLoaded, draft, onDraftConsumed }: ChatPanelProps) {
   const endRef = useRef<HTMLDivElement | null>(null)
   const [input, setInput] = useState('')
   const [confirmClear, setConfirmClear] = useState(false)
@@ -1158,7 +1177,7 @@ function ChatPanel({ messages, streamingContent, codeBlocks, isGenerating, onSen
               </div>` : ''}
           </div>
         ` : all.map((m: Message, i: number) => html`<${MessageBubble} key=${i} msg=${m} onApply=${onApply} appliedBlocks=${codeBlocks} />`)}
-        ${isGenerating && !streamingContent ? html`<div class="flex items-center gap-1 text-accent px-1 py-1"><span class="dot-pulse">●</span><span class="dot-pulse">●</span><span class="dot-pulse">●</span></div>` : ''}
+        ${isGenerating && !streamingContent ? html`<div class="flex items-center gap-2 px-1 py-1"><div class="flex items-center gap-1 text-accent"><span class="dot-pulse">●</span><span class="dot-pulse">●</span><span class="dot-pulse">●</span></div><span class="text-[10.5px] text-muted">${generationStatus || 'Working on-device…'}</span></div>` : ''}
         <div ref=${endRef} />
       </div>
       <div class="p-3 border-t border-line space-y-2">
@@ -1786,8 +1805,10 @@ function App() {
   const [messages, setMessages] = useState<Message[]>(saved.messages || [])
   const [streamingContent, setStreamingContent] = useState('')
   const [isGenerating, setIsGenerating] = useState(false)
+  const [generationStatus, setGenerationStatus] = useState('')
   const [codeBlocks, setCodeBlocks] = useState<CodeBlock[]>([])
   const [attachContext, setAttachContext] = useState(saved.attachContext ?? true)
+  const [modelAreaHidden, setModelAreaHidden] = useState(saved.modelAreaHidden ?? false)
   const [customModelUrl, setCustomModelUrl] = useState(saved.customModelUrl || '')
   const [savedFile, setSavedFile] = useState('')
   const [mobilePanel, setMobilePanel] = useState<'files' | 'chat' | null>(null)
@@ -1864,8 +1885,8 @@ function App() {
   }, [builtInTask])
 
   useEffect(() => {
-    saveState({ selectedProvider, selectedModel, customModelUrl, attachContext, messages })
-  }, [selectedProvider, selectedModel, customModelUrl, attachContext, messages])
+    saveState({ selectedProvider, selectedModel, customModelUrl, attachContext, modelAreaHidden, messages })
+  }, [selectedProvider, selectedModel, customModelUrl, attachContext, modelAreaHidden, messages])
 
   useEffect(() => {
     (async () => {
@@ -2025,6 +2046,7 @@ function App() {
     setMessages(newMsgs)
     setIsGenerating(true)
     setStreamingContent('')
+    setGenerationStatus('')
     setCodeBlocks([])
     abortRef.current = false
 
@@ -2078,6 +2100,7 @@ function App() {
             if (entry) setTreeData((prev: FileEntry[] | null) => addFileToTree(prev, path, entry))
           }
         }
+        if (chunk.status) setGenerationStatus(chunk.status)
         full = chunk.text
         setStreamingContent(full)
         const bl = parseCodeBlocks(full)
@@ -2105,6 +2128,7 @@ function App() {
       generatingRef.current = false
       setIsGenerating(false)
       setStreamingContent('')
+      setGenerationStatus('')
     }
   }, [messages, modelLoaded, currentModel, attachContext, treeData, selectedProvider])
 
@@ -2194,9 +2218,9 @@ function App() {
     } finally { setModelLoading(false) }
   }, [selectedModel, selectedProvider, customModelUrl])
 
-  const sidebarProps: SidebarProps = { treeData, indexedCount, expandedPaths, onToggleDir: handleToggleDir, onFileClick: handleFileClick, selectedFile, modelList, selectedModel, onModelChange: m => { setSelectedModel(m); setModelLoaded(false) }, modelLoaded, modelLoading, initProgress, onLoadModel: handleLoadModel, onOpenFolder: handleOpenFolder, attachContext, onAttachContextChange: setAttachContext, customModelUrl, onCustomModel: setCustomModelUrl, selectedProvider, onProviderChange: p => { if (p === PROVIDERS.BROWSER_AI && !window.__browserAiAvailable) return; setSelectedProvider(p); setSelectedModel(''); setModelLoaded(false); const models = getAvailableModels(4096); const first = models.find(m => m.provider === p); if (first) setSelectedModel(first.id) }, onShowBuiltInAI: () => setShowBuiltInAI(true) }
+  const sidebarProps: SidebarProps = { treeData, indexedCount, expandedPaths, onToggleDir: handleToggleDir, onFileClick: handleFileClick, selectedFile, modelList, selectedModel, onModelChange: m => { setSelectedModel(m); setModelLoaded(false) }, modelLoaded, modelLoading, initProgress, onLoadModel: handleLoadModel, onOpenFolder: handleOpenFolder, attachContext, onAttachContextChange: setAttachContext, customModelUrl, onCustomModel: setCustomModelUrl, selectedProvider, onProviderChange: p => { if (p === PROVIDERS.BROWSER_AI && !window.__browserAiAvailable) return; setSelectedProvider(p); setSelectedModel(''); setModelLoaded(false); const models = getAvailableModels(4096); const first = models.find(m => m.provider === p); if (first) setSelectedModel(first.id) }, modelAreaHidden, onToggleModelArea: () => setModelAreaHidden(v => !v), onShowBuiltInAI: () => setShowBuiltInAI(true) }
 
-  const chatProps: ChatPanelProps = { messages, streamingContent, codeBlocks, isGenerating, onSend: handleSend, onStop: handleStop, onApply: handleApply, onClear: handleClear, onExport: handleExportChat, modelLoaded, draft: chatDraft, onDraftConsumed: consumeChatDraft }
+  const chatProps: ChatPanelProps = { messages, streamingContent, codeBlocks, isGenerating, generationStatus, onSend: handleSend, onStop: handleStop, onApply: handleApply, onClear: handleClear, onExport: handleExportChat, modelLoaded, draft: chatDraft, onDraftConsumed: consumeChatDraft }
   const quickFiles = useMemo(() => quickOpen ? [...fileHandles.keys()].sort() : [], [quickOpen, indexedCount])
   const modelLabel = modelList.find(m => m.id === selectedModel)?.label || selectedModel
 
