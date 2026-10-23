@@ -1,5 +1,6 @@
 import { html, render, useState, useEffect, useRef, useCallback, useMemo } from 'htm/preact/standalone.mjs'
-import { PROVIDERS, getAvailableModels, estimateVRAM, getPreferredModel, checkProviderAvailability, initProviderModel, createChatStream, createTools, type Provider, type ModelDescriptor } from './llm-provider'
+import { PROVIDERS, getAvailableModels, estimateVRAM, getPreferredModel, checkProviderAvailability, getBrowserAIStatus, initProviderModel, createChatStream, createTools, type Provider, type ModelDescriptor } from './llm-provider'
+import { createHarnessTools, streamChromeHarness, type HarnessTool } from './chrome-harness'
 import type { LanguageModel, ModelMessage } from 'ai'
 
 interface Notification {
@@ -40,6 +41,8 @@ interface FileEntry {
   path: string
   type: 'dir' | 'file'
   children?: FileEntry[]
+  /** Directory children have been enumerated. */
+  loaded?: boolean
   handle: FileSystemHandle
 }
 
@@ -71,7 +74,9 @@ interface ChatChunk {
 declare global {
   interface Window {
     __gpuAvailable: boolean
+    __transformersAvailable: boolean
     __browserAiAvailable: boolean
+    __browserAiNote: string
     MonacoEnvironment: {
       getWorker: (id: string, label: string) => Worker
     }
@@ -82,7 +87,7 @@ declare global {
   }
 }
 
-const STORAGE_KEY = 'webcoder-state'
+const STORAGE_KEY = 'coder-state'
 
 interface PersistedState {
   selectedProvider: Provider
@@ -174,17 +179,9 @@ const LANG_MAP: Record<string, string> = {
   '.wasm':'plaintext','.lock':'plaintext',
 }
 
-const SYSTEM_PROMPT = `You are WebCoder, an AI coding assistant running entirely inside the user's browser. All computation is local and private.
+const SYSTEM_PROMPT = `You are Coder, an AI coding assistant running entirely inside the user's browser. All computation is local and private.
 
-You have access to tools:
-- readFile(path): Read file contents
-- editFile(path, content): Overwrite an existing file's content
-- createFile(path, content): Create a new file (fails if file exists)
-- deleteFile(path): Delete a file
-
-Use readFile to examine files before making changes. Use createFile for new files and editFile for existing ones. Use deleteFile to remove files.
-
-When suggesting code changes, ALWAYS use a code block with a file path header like this:
+When file tools are not available, suggest code changes with a code block that includes the file path header like this:
 \`\`\`language:path/to/file.js
 // your code here
 \`\`\`
@@ -194,8 +191,25 @@ Rules:
 2. When creating new files, specify the full path relative to the project root.
 3. Explain your changes concisely before the code block.
 4. If multiple files need changes, use separate code blocks for each.
-5. Be precise and minimal in your code changes. Show only the changed lines when possible.
+5. Be precise and minimal in your code changes.
 6. When asked to review code, point out specific issues with line numbers.`
+
+const TOOL_SYSTEM_PROMPT = `${SYSTEM_PROMPT}
+
+You can inspect and modify the user's local project with tools:
+- listFiles: list project file paths (optionally filter by directory or filename substring)
+- searchFiles: case-insensitive search in file contents
+- readFile: read a file, optionally a 1-based line range
+- createFile: create a new file
+- editFile: overwrite an existing file (creates it if missing)
+- deleteFile: delete a file
+
+Rules for tool use:
+1. Find relevant files first (listFiles/searchFiles), then read them before editing.
+2. Paths are relative to the project root. Never invent file contents.
+3. Make minimal, complete edits; verify the result when practical.
+4. If a tool returns an error, adapt instead of repeating the same call.
+5. When done, summarize exactly what changed and where.`
 
 let editor: any = null
 let currentFilePath: string | null = null
@@ -229,19 +243,18 @@ async function writeFileContent(fileHandle: FileSystemFileHandle, content: strin
   await writable.close()
 }
 
-async function walkDir(dirHandle: FileSystemDirectoryHandle, path = '', depth = 0): Promise<FileEntry[]> {
-  if (depth > MAX_DEPTH) return []
+/** Enumerates one directory level. Child directories stay unloaded until expanded. */
+async function readDirEntries(dirHandle: FileSystemDirectoryHandle, path = '', generation = folderGeneration): Promise<FileEntry[]> {
   const entries: FileEntry[] = []
   for await (const [name, handle] of dirHandle.entries()) {
     if (EXCLUDED.has(name)) continue
     const entryPath = path ? `${path}/${name}` : name
     if (handle.kind === 'directory') {
-      const children = await walkDir(handle as FileSystemDirectoryHandle, entryPath, depth + 1)
-      if (children.length > 0 || depth < 2) {
-        entries.push({ name, path: entryPath, type: 'dir', children, handle })
-      }
+      entries.push({ name, path: entryPath, type: 'dir', handle, loaded: false })
     } else {
-      entries.push({ name, path: entryPath, type: 'file', handle })
+      const entry: FileEntry = { name, path: entryPath, type: 'file', handle }
+      entries.push(entry)
+      if (generation === folderGeneration) fileHandles.set(entryPath, entry)
     }
   }
   entries.sort((a, b) => {
@@ -251,20 +264,95 @@ async function walkDir(dirHandle: FileSystemDirectoryHandle, path = '', depth = 
   return entries
 }
 
+const MAX_INDEX_ENTRIES = 50000
+let folderGeneration = 0
+let indexPromise: Promise<void> | null = null
+const loadingDirs = new Set<string>()
+
+/**
+ * Builds the path index used by the AI tools without ever blocking the tree
+ * UI. Runs in the background, yields to the event loop periodically and stops
+ * when the folder changes or the entry budget is reached.
+ */
+async function indexFolder(
+  dirHandle: FileSystemDirectoryHandle,
+  generation: number,
+  onProgress?: (indexedFiles: number) => void
+): Promise<void> {
+  const queue: Array<{ handle: FileSystemDirectoryHandle; path: string; depth: number }> = [
+    { handle: dirHandle, path: '', depth: 0 },
+  ]
+  let seen = 0
+  try {
+    for (let cursor = 0; cursor < queue.length; cursor++) {
+      if (generation !== folderGeneration) return
+      const current = queue[cursor]
+      if (current.depth > MAX_DEPTH) continue
+      try {
+        for await (const [name, child] of current.handle.entries()) {
+          if (generation !== folderGeneration) return
+          if (EXCLUDED.has(name)) continue
+          const path = current.path ? `${current.path}/${name}` : name
+          if (child.kind === 'directory') {
+            queue.push({ handle: child, path, depth: current.depth + 1 })
+          } else if (!fileHandles.has(path)) {
+            fileHandles.set(path, { name, path, type: 'file', handle: child })
+          }
+          if (++seen >= MAX_INDEX_ENTRIES) return
+          if (seen % 250 === 0) {
+            onProgress?.(fileHandles.size)
+            const { promise, resolve } = Promise.withResolvers<void>()
+            setTimeout(resolve, 0)
+            await promise
+          }
+        }
+      } catch (err) {
+        console.warn('indexFolder:', current.path, err)
+      }
+    }
+  } finally {
+    if (generation === folderGeneration) onProgress?.(fileHandles.size)
+  }
+}
+
+async function ensureIndexed(): Promise<void> {
+  if (indexPromise) await indexPromise
+}
+
+async function resolveFileHandle(path: string): Promise<FileSystemFileHandle | null> {
+  const cached = fileHandles.get(path)
+  if (cached) return cached.handle as FileSystemFileHandle
+  if (!rootDirHandle) return null
+  try {
+    const parts = path.split('/')
+    let dir: FileSystemDirectoryHandle = rootDirHandle
+    for (let i = 0; i < parts.length - 1; i++) dir = await dir.getDirectoryHandle(parts[i])
+    const handle = await dir.getFileHandle(parts[parts.length - 1])
+    fileHandles.set(path, { name: parts[parts.length - 1], path, type: 'file', handle })
+    return handle
+  } catch {
+    return null
+  }
+}
+
 function getLanguage(filePath: string): string {
   const ext = filePath.match(/(\.[^.]+)$/)?.[1] || ''
   return LANG_MAP[ext] || 'plaintext'
 }
 
-async function openFolder(): Promise<FileEntry[] | null> {
+async function openFolder(onIndexProgress?: (indexedFiles: number) => void): Promise<FileEntry[] | null> {
   try {
     const handle = await (window as any).showDirectoryPicker()
+    const generation = ++folderGeneration
     rootDirHandle = handle
     rootDirName = handle.name
     fileHandles.clear()
-    const entries = await walkDir(handle)
-    function idx(list: FileEntry[]) { for (const e of list) { if (e.type === 'file') fileHandles.set(e.path, e); if (e.children) idx(e.children) } }
-    idx(entries)
+    loadingDirs.clear()
+    // Render only the top level immediately; nested directories load on
+    // expand, while a background index feeds the AI tools.
+    const entries = await readDirEntries(handle)
+    if (generation !== folderGeneration) return null
+    indexPromise = indexFolder(handle, generation, onIndexProgress)
     return entries
   } catch (err) {
     if ((err as Error).name !== 'AbortError' && (err as Error).name !== 'SecurityError') throw err
@@ -274,13 +362,13 @@ async function openFolder(): Promise<FileEntry[] | null> {
 
 async function loadFile(path: string): Promise<string | null> {
   if (!editor) { console.warn('Editor not ready'); return null }
-  const entry = fileHandles.get(path)
-  if (!entry) return null
-  if (!await verifyPermission(entry.handle, false)) { alert(`Cannot read ${path}`); return null }
+  const handle = await resolveFileHandle(path)
+  if (!handle) return null
+  if (!await verifyPermission(handle, false)) { alert(`Cannot read ${path}`); return null }
   try {
-    const content = await readFileContent(entry.handle as FileSystemFileHandle)
+    const content = await readFileContent(handle)
     currentFilePath = path
-    currentFileHandle = entry.handle as FileSystemFileHandle
+    currentFileHandle = handle
     if (monacoModels.has(path)) {
       const m = monacoModels.get(path)
       if (m.getValue() !== content) m.setValue(content)
@@ -299,12 +387,12 @@ async function loadFile(path: string): Promise<string | null> {
 
 async function saveFile(path?: string): Promise<boolean> {
   const targetPath = path || currentFilePath
-  if (!targetPath) return false
-  const entry = fileHandles.get(targetPath)
-  if (!entry || !editor) return false
-  if (!await verifyPermission(entry.handle, true)) { alert(`Cannot write ${targetPath}`); return false }
+  if (!targetPath || !editor) return false
+  const handle = await resolveFileHandle(targetPath)
+  if (!handle) return false
+  if (!await verifyPermission(handle, true)) { alert(`Cannot write ${targetPath}`); return false }
   try {
-    await writeFileContent(entry.handle as FileSystemFileHandle, editor.getValue())
+    await writeFileContent(handle, editor.getValue())
     return true
   } catch (err) { console.error('saveFile:', err); return false }
 }
@@ -374,21 +462,60 @@ function stopGeneration(): void {
   }
 }
 
-async function* streamChat(messages: ModelMessage[], system?: string, tools?: Record<string, any>, signal?: AbortSignal): AsyncGenerator<ChatChunk> {
+async function* streamChat(messages: ModelMessage[], system?: string, plainSystem?: string, tools?: HarnessTool[] | Record<string, any>, signal?: AbortSignal): AsyncGenerator<ChatChunk> {
   if (!currentModel) throw new Error('Model not initialized')
+  const provider = (currentModel as any).provider || PROVIDERS.WEBLLM
+
+  if (provider === PROVIDERS.BROWSER_AI) {
+    for await (const event of streamChromeHarness({
+      system: system || '',
+      plainSystem: plainSystem || system || '',
+      messages,
+      tools: Array.isArray(tools) ? tools : [],
+      signal,
+    })) {
+      if (signal?.aborted) break
+      if (event.type === 'text') {
+        yield { text: event.text, done: false, delta: event.delta, usage: null }
+      } else if (event.type === 'tool-call') {
+        console.log('Tool call:', event.name, event.args)
+      } else if (event.type === 'tool-result') {
+        console.log('Tool result:', event.name, event.ok ? 'ok' : 'error', event.preview)
+      } else if (event.type === 'fallback') {
+        addNotification(`Chrome tool use unavailable (${event.reason}). Continuing without project tools.`, 'warning')
+      } else if (event.type === 'done') {
+        yield { text: event.text, done: true, delta: '', usage: null }
+        return
+      }
+    }
+    yield { text: '', done: true, delta: '', usage: null }
+    return
+  }
+
   let full = ''
   try {
-    const result = createChatStream({ provider: (currentModel as any).provider || PROVIDERS.WEBLLM, model: currentModel, messages, system, tools, abortSignal: signal })
+    const result = createChatStream({ provider, model: currentModel, messages, system, tools: tools as Record<string, any>, abortSignal: signal })
     for await (const part of result.fullStream) {
       if (signal?.aborted) break
       if (part.type === 'text-delta') {
-        full += part.text
-        const cleaned = full.replace(/<think>[\s\S]*?<\/think>/g, '').trim()
-        yield { text: cleaned, done: false, delta: part.text, usage: null }
-      } else if (part.type === 'tool-call') {
-        console.log('Tool call:', part.toolName, part.input)
-      } else if (part.type === 'tool-result') {
-        console.log('Tool result:', part.toolName, part.output)
+        full += (part as any).text ?? (part as any).delta ?? ''
+        const cleaned = full.replace(/ thinking[\s\S]*?<\/think>/g, '').trim()
+        yield { text: cleaned, done: false, delta: (part as any).text ?? (part as any).delta ?? '', usage: null }
+      } else if ((part as any).type === 'reasoning-delta') {
+        // Some providers stream thinking as reasoning deltas; surface it so
+        // the bubble never stays empty while the model is working.
+        full += (part as any).delta ?? (part as any).text ?? ''
+        const cleaned = full.replace(/ thinking[\s\S]*?<\/think>/g, '').trim()
+        yield { text: cleaned, done: false, delta: (part as any).delta ?? '', usage: null }
+      } else if ((part as any).type === 'tool-call' || (part as any).type === 'tool-input-available' || (part as any).type === 'tool-input-start') {
+        console.log('Tool call:', (part as any).toolName || 'unknown tool', (part as any).input ?? (part as any).args)
+      } else if ((part as any).type === 'tool-result' || (part as any).type === 'tool-output-available') {
+        console.log('Tool result:', (part as any).toolName, (part as any).output)
+      } else if ((part as any).type === 'error') {
+        const raw = (part as any).error ?? (part as any).errorText ?? (part as any).message
+        const detail = raw instanceof Error ? raw.message : typeof raw === 'string' ? raw : JSON.stringify(raw ?? part)
+        console.error('Chat stream error part:', part)
+        throw new Error(detail || 'Stream error')
       }
     }
     const cleaned = full.replace(/<think>[\s\S]*?<\/think>/g, '').trim()
@@ -427,6 +554,22 @@ function parseCodeBlocks(text: string): CodeBlock[] {
   return blocks
 }
 
+function updateEntry(
+  entries: FileEntry[] | null,
+  path: string,
+  update: (entry: FileEntry) => FileEntry
+): FileEntry[] | null {
+  if (!entries) return null
+  return entries.map(entry => {
+    if (entry.path === path) return update(entry)
+    if (entry.children && path.startsWith(`${entry.path}/`)) {
+      const children = updateEntry(entry.children, path, update)
+      if (children !== entry.children) return { ...entry, children: children ?? [] }
+    }
+    return entry
+  })
+}
+
 function buildFileTree(treeData: FileEntry[]): string {
   const lines = [`Project: ${rootDirName}`, '']
   function flat(entries: FileEntry[], p = '') {
@@ -440,11 +583,10 @@ function buildFileTree(treeData: FileEntry[]): string {
 }
 
 async function readFileForTool(path: string): Promise<string | null> {
-  const entry = fileHandles.get(path)
-  if (!entry) return null
+  const handle = await resolveFileHandle(path)
+  if (!handle) return null
   try {
-    const content = await readFileContent(entry.handle as FileSystemFileHandle)
-    return content
+    return await readFileContent(handle)
   } catch {
     return null
   }
@@ -467,11 +609,10 @@ async function createFileForTool(path: string, content: string): Promise<boolean
 }
 
 async function deleteFileForTool(path: string): Promise<boolean> {
-  const entry = fileHandles.get(path)
-  if (!entry) return false
+  if (!rootDirHandle) return false
   try {
     const parts = path.split('/')
-    let dirHandle = rootDirHandle!
+    let dirHandle: FileSystemDirectoryHandle = rootDirHandle
     for (let i = 0; i < parts.length - 1; i++) {
       dirHandle = await dirHandle.getDirectoryHandle(parts[i])
     }
@@ -491,8 +632,9 @@ async function deleteFileForTool(path: string): Promise<boolean> {
 
 interface SidebarProps {
   treeData: FileEntry[] | null
+  indexedCount: number
   expandedPaths: Set<string>
-  onToggleDir: (path: string) => void
+  onToggleDir: (entry: FileEntry) => void
   onFileClick: (path: string) => void
   selectedFile: string | null
   modelList: ModelDescriptor[]
@@ -511,8 +653,8 @@ interface SidebarProps {
   onProviderChange: (provider: Provider) => void
 }
 
-function Sidebar({ treeData, expandedPaths, onToggleDir, onFileClick, selectedFile, modelList, selectedModel, onModelChange, modelLoaded, modelLoading, initProgress, onLoadModel, onOpenFolder, attachContext, onAttachContextChange, customModelUrl, onCustomModel, selectedProvider, onProviderChange }: SidebarProps) {
-  const fileCount = useMemo(() => {
+function Sidebar({ treeData, indexedCount, expandedPaths, onToggleDir, onFileClick, selectedFile, modelList, selectedModel, onModelChange, modelLoaded, modelLoading, initProgress, onLoadModel, onOpenFolder, attachContext, onAttachContextChange, customModelUrl, onCustomModel, selectedProvider, onProviderChange }: SidebarProps) {
+  const visibleCount = useMemo(() => {
     if (!treeData) return 0
     let n = 0
     function w(e: FileEntry[]) { for (const x of e) { if (x.type === 'file') n++; if (x.children) w(x.children) } }
@@ -527,7 +669,7 @@ function Sidebar({ treeData, expandedPaths, onToggleDir, onFileClick, selectedFi
           <span>📂</span>
           <span>${treeData ? 'Change Folder' : 'Open Local Folder'}</span>
         </button>
-        ${treeData ? html`<div class="text-xs text-gray-500 flex items-center justify-between"><span class="truncate">${rootDirName}</span><span>${fileCount} files</span></div>` : ''}
+        ${treeData ? html`<div class="text-xs text-gray-500 flex items-center justify-between"><span class="truncate">${rootDirName}</span><span>${Math.max(visibleCount, indexedCount)} files</span></div>` : ''}
       </div>
       <div class="flex-1 overflow-y-auto scrollbar-thin">
         ${treeData ? html`<${FileTree} entries=${treeData} expandedPaths=${expandedPaths} onToggle=${onToggleDir} onFileClick=${onFileClick} selectedFile=${selectedFile} depth=${0} />`
@@ -536,8 +678,8 @@ function Sidebar({ treeData, expandedPaths, onToggleDir, onFileClick, selectedFi
       <div class="p-3 border-t border-[#3c3c3c] space-y-2">
         <select class="w-full bg-[#3c3c3c] text-gray-200 text-xs rounded px-2 py-1.5 border border-[#4c4c4c] outline-none focus:border-blue-500" value=${selectedProvider} onChange=${(e: Event) => onProviderChange((e.target as HTMLSelectElement).value as Provider)} disabled=${modelLoading}>
           ${window.__gpuAvailable ? html`<option value=${PROVIDERS.WEBLLM}>WebLLM</option>` : ''}
-          ${window.__gpuAvailable ? html`<option value=${PROVIDERS.TRANSFORMERS_JS}>Transformers.js</option>` : ''}
-          ${window.__browserAiAvailable ? html`<option value=${PROVIDERS.BROWSER_AI}>Chrome Built-in AI</option>` : html`<option disabled>Chrome AI (not available)</option>`}
+          ${window.__transformersAvailable ? html`<option value=${PROVIDERS.TRANSFORMERS_JS}>Transformers.js</option>` : ''}
+          ${window.__browserAiAvailable ? html`<option value=${PROVIDERS.BROWSER_AI}>Chrome Built-in AI</option>` : html`<option disabled>${window.__browserAiNote || 'Chrome AI (not available)'}</option>`}
         </select>
         <select class="w-full bg-[#3c3c3c] text-gray-200 text-xs rounded px-2 py-1.5 border border-[#4c4c4c] outline-none focus:border-blue-500" value=${selectedModel} onChange=${(e: Event) => onModelChange((e.target as HTMLSelectElement).value)} disabled=${modelLoading}>
           ${modelList.filter(m => m.provider === selectedProvider).map(m => html`<option value=${m.id}>${m.label || m.id}${m.vram ? ' ('+m.vram+'MB)' : ''}</option>`)}
@@ -561,7 +703,7 @@ function Sidebar({ treeData, expandedPaths, onToggleDir, onFileClick, selectedFi
 interface FileTreeProps {
   entries: FileEntry[]
   expandedPaths: Set<string>
-  onToggle: (path: string) => void
+  onToggle: (entry: FileEntry) => void
   onFileClick: (path: string) => void
   selectedFile: string | null
   depth: number
@@ -572,12 +714,16 @@ function FileTree({ entries, expandedPaths, onToggle, onFileClick, selectedFile,
     if (e.type === 'dir') {
       const open = expandedPaths.has(e.path)
       return html`<div key=${e.path}>
-        <div class="flex items-center cursor-pointer px-2 py-0.5 text-gray-300 hover:bg-[#2a2a2a] file-tree-item" style=${{ paddingLeft: `${depth*14+8}px` }} onClick=${() => onToggle(e.path)}>
+        <div class="flex items-center cursor-pointer px-2 py-0.5 text-gray-300 hover:bg-[#2a2a2a] file-tree-item" style=${{ paddingLeft: `${depth*14+8}px` }} onClick=${() => onToggle(e)}>
           <span class="text-xs w-4 shrink-0">${open ? '▾' : '▸'}</span>
           <span class="text-xs mr-1 shrink-0">${open ? '📂' : '📁'}</span>
           <span class="text-xs truncate">${e.name}</span>
         </div>
-        ${open && e.children ? html`<${FileTree} entries=${e.children} expandedPaths=${expandedPaths} onToggle=${onToggle} onFileClick=${onFileClick} selectedFile=${selectedFile} depth=${depth+1} />` : ''}
+        ${open
+          ? e.loaded
+            ? (e.children ? html`<${FileTree} entries=${e.children} expandedPaths=${expandedPaths} onToggle=${onToggle} onFileClick=${onFileClick} selectedFile=${selectedFile} depth=${depth+1} />` : '')
+            : html`<div class="text-xs text-gray-600 py-0.5" style=${{ paddingLeft: `${(depth+1)*14+8}px` }}>Loading…</div>`
+          : ''}
       </div>`
     }
     return html`<div key=${e.path} class="flex items-center cursor-pointer px-2 py-0.5 ${e.path===selectedFile?'bg-[#37373d] text-white':'text-gray-400 hover:text-gray-200'} file-tree-item" style=${{ paddingLeft: `${depth*14+8}px` }} onClick=${() => onFileClick(e.path)}>
@@ -612,7 +758,7 @@ function MessageBubble({ msg, onApply, appliedBlocks }: MessageBubbleProps) {
   return html`
     <div class="flex ${msg.role==='user'?'justify-end':'justify-start'}">
       <div class="max-w-[92%] ${msg.role==='user'?'bg-blue-700 text-white rounded-2xl rounded-br-sm':'bg-[#2d2d2d] text-gray-200 rounded-2xl rounded-bl-sm'} px-3 py-2">
-        ${msg.role==='assistant' ? html`<div class="text-[11px] text-gray-500 mb-1 font-medium">WebCoder</div>` : ''}
+        ${msg.role==='assistant' ? html`<div class="text-[11px] text-gray-500 mb-1 font-medium">Coder</div>` : ''}
         <div class="text-xs leading-relaxed whitespace-pre-wrap break-words">
           ${parts.map((p: any, i: number) => {
             if (p.t === 'text') return html`<span key=${i}>${p.v}</span>`
@@ -713,6 +859,7 @@ function ChatPanel({ messages, streamingContent, codeBlocks, isGenerating, onSen
 function App() {
   const saved = loadState()
   const [treeData, setTreeData] = useState<FileEntry[] | null>(null)
+  const [indexedCount, setIndexedCount] = useState(0)
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(new Set())
   const [selectedFile, setSelectedFile] = useState<string | null>(null)
   const [selectedProvider, setSelectedProvider] = useState<Provider>((saved.selectedProvider as Provider) || PROVIDERS.WEBLLM)
@@ -751,12 +898,17 @@ function App() {
     (async () => {
       try {
         const vram = await estimateVRAM()
-        let models = getAvailableModels(vram)
-        if (!window.__browserAiAvailable) {
-          models = models.filter(m => m.provider !== PROVIDERS.BROWSER_AI)
-        }
+        const providerUsable = (p: Provider) =>
+          p === PROVIDERS.WEBLLM ? window.__gpuAvailable
+          : p === PROVIDERS.TRANSFORMERS_JS ? window.__transformersAvailable
+          : p === PROVIDERS.BROWSER_AI ? window.__browserAiAvailable : false
+        const models = getAvailableModels(vram).filter(m => providerUsable(m.provider))
         setModelList(models)
-        if (!saved.selectedModel) {
+        // Fall back to a usable provider when nothing is saved, or when the
+        // saved provider (e.g. Chrome Built-in AI on Chromium/Linux) is not
+        // available in this browser.
+        const savedUsable = saved.selectedModel && saved.selectedProvider && providerUsable(saved.selectedProvider as Provider)
+        if (!savedUsable) {
           const preferred = getPreferredModel(models)
           if (preferred) {
             setSelectedModel(preferred.id)
@@ -765,14 +917,23 @@ function App() {
         }
       } catch {
         const fallback: ModelDescriptor[] = [
-          { id: 'Llama-3.2-1B-Instruct-q4f16_1-MLC', vram: 1024, provider: PROVIDERS.WEBLLM },
-          { id: 'Qwen2.5-Coder-1.5B-Instruct-q4f16_1-MLC', vram: 2048, provider: PROVIDERS.WEBLLM },
-          { id: 'Qwen2.5-Coder-7B-Instruct-q4f16_1-MLC', vram: 8192, provider: PROVIDERS.WEBLLM },
+          { id: 'HuggingFaceTB/SmolLM2-360M-Instruct', vram: 512, provider: PROVIDERS.TRANSFORMERS_JS, label: 'SmolLM2 360M' },
+          { id: 'Qwen2.5-Coder-1.5B-Instruct-q4f16_1-MLC', vram: 1630, provider: PROVIDERS.WEBLLM, label: 'Qwen2.5 Coder 1.5B' },
+          { id: 'Qwen3.5-2B-q4f16_1-MLC', vram: 2245, provider: PROVIDERS.WEBLLM, label: 'Qwen3.5 2B' },
+          { id: 'Qwen2.5-Coder-7B-Instruct-q4f16_1-MLC', vram: 5107, provider: PROVIDERS.WEBLLM, label: 'Qwen2.5 Coder 7B' },
         ]
-        setModelList(fallback)
-        if (!saved.selectedModel) {
-          setSelectedModel(fallback[0].id)
-          setSelectedProvider(PROVIDERS.WEBLLM)
+        const usable = fallback.filter(m =>
+          m.provider === PROVIDERS.WEBLLM ? window.__gpuAvailable
+          : m.provider === PROVIDERS.TRANSFORMERS_JS ? window.__transformersAvailable
+          : m.provider === PROVIDERS.BROWSER_AI ? window.__browserAiAvailable : false)
+        setModelList(usable.length ? usable : fallback)
+        const savedUsable = (saved.selectedProvider as Provider) === PROVIDERS.WEBLLM ? window.__gpuAvailable
+          : (saved.selectedProvider as Provider) === PROVIDERS.TRANSFORMERS_JS ? window.__transformersAvailable
+          : (saved.selectedProvider as Provider) === PROVIDERS.BROWSER_AI ? window.__browserAiAvailable : false
+        if (!saved.selectedModel || !savedUsable) {
+          const first = (usable.length ? usable : fallback)[0]
+          setSelectedModel(first.id)
+          setSelectedProvider(first.provider)
         }
       }
     })()
@@ -783,8 +944,9 @@ function App() {
   }, [])
 
   const handleOpenFolder = useCallback(async () => {
-    const entries = await openFolder()
+    const entries = await openFolder(setIndexedCount)
     if (!entries) return
+    setIndexedCount(fileHandles.size)
     for (const m of monacoModels.values()) m.dispose()
     monacoModels.clear()
     setTreeData(entries)
@@ -795,8 +957,24 @@ function App() {
     setFileStatus('')
   }, [])
 
-  const handleToggleDir = useCallback((path: string) => {
+  const handleToggleDir = useCallback((entry: FileEntry) => {
+    const path = entry.path
     setExpandedPaths((p: Set<string>) => { const n = new Set(p); n.has(path) ? n.delete(path) : n.add(path); return n })
+    if (entry.type !== 'dir' || entry.loaded || loadingDirs.has(path)) return
+
+    const generation = folderGeneration
+    loadingDirs.add(path)
+    readDirEntries(entry.handle as FileSystemDirectoryHandle, path, generation)
+      .then(children => {
+        if (generation !== folderGeneration) return
+        setTreeData((prev: FileEntry[] | null) => updateEntry(prev, path, item => ({ ...item, children, loaded: true })))
+      })
+      .catch(err => {
+        console.error('load dir:', path, err)
+        addNotification(`Could not load ${path}`, 'error')
+        setExpandedPaths(prev => { const next = new Set(prev); next.delete(path); return next })
+      })
+      .finally(() => loadingDirs.delete(path))
   }, [])
 
   const handleFileClick = useCallback(async (path: string) => {
@@ -818,25 +996,45 @@ function App() {
     abortRef.current = false
 
     const fileTree = attachContext && treeData ? buildFileTree(treeData) : null
-    let systemMsg = fileTree ? `${SYSTEM_PROMPT}\n\nProject file tree:\n${fileTree}` : SYSTEM_PROMPT
+    const isChromeAI = selectedProvider === PROVIDERS.BROWSER_AI
+    let plainSystem = fileTree ? `${SYSTEM_PROMPT}\n\nProject file tree:\n${fileTree}` : SYSTEM_PROMPT
+    // Send the full conversation history on every turn: the Chrome harness
+    // creates a fresh Prompt API session per turn, so history is applied once.
     const chatMsgs: ModelMessage[] = [
-      { role: 'user', content: text },
+      ...newMsgs
+        .filter(m => m.role === 'user' || m.role === 'assistant')
+        .map(m => ({ role: m.role, content: m.content } as ModelMessage)),
     ]
 
-    const isChromeAI = selectedProvider === PROVIDERS.BROWSER_AI
-    let tools = attachContext && !isChromeAI ? createTools(readFileForTool, applyFileChanges, createFileForTool, deleteFileForTool) : undefined
+    let tools: HarnessTool[] | Record<string, any> | undefined
+    if (attachContext) {
+      tools = isChromeAI
+        ? createHarnessTools({
+            listFiles: async () => { await ensureIndexed(); return [...fileHandles.keys()] },
+            readFile: readFileForTool,
+            writeFile: applyFileChanges,
+            createFile: createFileForTool,
+            deleteFile: deleteFileForTool,
+          })
+        : createTools(readFileForTool, applyFileChanges, createFileForTool, deleteFileForTool)
+    }
 
-    if (isChromeAI && attachContext && currentFilePath && editor) {
+    // Without tools Chrome cannot inspect files, so keep the open file in the
+    // prompt (also used by the harness if native tool use is unavailable).
+    if (isChromeAI && !attachContext && currentFilePath && editor) {
       const model = editor.getModel()
       if (model) {
-        const fileContent = model.getValue()
-        systemMsg += `\n\nCurrent open file: ${currentFilePath}\n\`\`\`\n${fileContent}\n\`\`\``
+        plainSystem += `\n\nCurrent open file: ${currentFilePath}\n\`\`\`\n${model.getValue()}\n\`\`\``
       }
     }
 
+    const systemMsg = attachContext
+      ? (fileTree ? `${TOOL_SYSTEM_PROMPT}\n\nProject file tree:\n${fileTree}` : TOOL_SYSTEM_PROMPT)
+      : plainSystem
+
     try {
       let full = ''
-      for await (const chunk of streamChat(chatMsgs, systemMsg, tools, abortController.signal)) {
+      for await (const chunk of streamChat(chatMsgs, systemMsg, plainSystem, tools, abortController.signal)) {
         if (abortRef.current) break
         full = chunk.text
         setStreamingContent(full)
@@ -844,13 +1042,23 @@ function App() {
         if (bl.length) setCodeBlocks(bl)
       }
       if (!abortRef.current) {
+        if (!full.trim()) {
+          full = 'The model returned an empty response. Try asking again, or switch to WebLLM for larger models.'
+        }
         setMessages((prev: Message[]) => [...prev, { role: 'assistant', content: full }])
         setStreamingContent('')
         setCodeBlocks(parseCodeBlocks(full))
       }
     } catch (err) {
       console.error('Generation error:', err)
-      setMessages((prev: Message[]) => [...prev, { role: 'assistant', content: `Error: ${(err as Error).message || err || 'Generation failed'}` }])
+      let detail = (err as Error).message || (err as Error).toString() || 'Generation failed'
+      if (selectedProvider === PROVIDERS.BROWSER_AI) {
+        try {
+          const status = await getBrowserAIStatus()
+          if (status.status !== 'available' && status.status !== 'needs-download') detail = status.message
+        } catch {}
+      }
+      setMessages((prev: Message[]) => [...prev, { role: 'assistant', content: `Error: ${detail}` }])
     } finally {
       generatingRef.current = false
       setIsGenerating(false)
@@ -888,17 +1096,25 @@ function App() {
     } catch (err) {
       const msg = (err as Error)?.message || (err as Error)?.toString() || 'Model failed to load (check console for details)'
       console.error('Model load error:', err)
-      const userMsg = msg.includes('Built-in model not available')
-        ? 'Chrome AI model needs downloading. Go to chrome://components and update "Optimization Guide On Device Model".'
-        : msg.includes('not enough space')
-          ? 'Not enough storage for Chrome AI model. Try WebLLM instead.'
-          : `Error: ${msg}`
+      let userMsg = `Error: ${msg}`
+      if (provider === PROVIDERS.BROWSER_AI) {
+        // Report the live Prompt API status — on Chromium/Linux this explains
+        // that the on-device model simply is not shipped, instead of pointing
+        // at chrome://components entries that do not exist there.
+        try {
+          userMsg = (await getBrowserAIStatus()).message
+        } catch {
+          userMsg = `Error: ${msg}`
+        }
+      } else if (msg.includes('not enough space')) {
+        userMsg = 'Not enough storage for the model. Try a smaller model.'
+      }
       setInitProgress({ text: userMsg, progress: 0 })
       setTimeout(() => setInitProgress(null), 10000)
     } finally { setModelLoading(false) }
   }, [selectedModel, selectedProvider, customModelUrl])
 
-  const sidebarProps: SidebarProps = { treeData, expandedPaths, onToggleDir: handleToggleDir, onFileClick: handleFileClick, selectedFile, modelList, selectedModel, onModelChange: m => { setSelectedModel(m); setModelLoaded(false) }, modelLoaded, modelLoading, initProgress, onLoadModel: handleLoadModel, onOpenFolder: handleOpenFolder, attachContext, onAttachContextChange: setAttachContext, customModelUrl, onCustomModel: setCustomModelUrl, selectedProvider, onProviderChange: p => { if (p === PROVIDERS.BROWSER_AI && !window.__browserAiAvailable) return; setSelectedProvider(p); setSelectedModel(''); setModelLoaded(false); const models = getAvailableModels(4096); const first = models.find(m => m.provider === p); if (first) setSelectedModel(first.id) } }
+  const sidebarProps: SidebarProps = { treeData, indexedCount, expandedPaths, onToggleDir: handleToggleDir, onFileClick: handleFileClick, selectedFile, modelList, selectedModel, onModelChange: m => { setSelectedModel(m); setModelLoaded(false) }, modelLoaded, modelLoading, initProgress, onLoadModel: handleLoadModel, onOpenFolder: handleOpenFolder, attachContext, onAttachContextChange: setAttachContext, customModelUrl, onCustomModel: setCustomModelUrl, selectedProvider, onProviderChange: p => { if (p === PROVIDERS.BROWSER_AI && !window.__browserAiAvailable) return; setSelectedProvider(p); setSelectedModel(''); setModelLoaded(false); const models = getAvailableModels(4096); const first = models.find(m => m.provider === p); if (first) setSelectedModel(first.id) } }
 
   const chatProps: ChatPanelProps = { messages, streamingContent, codeBlocks, isGenerating, onSend: handleSend, onStop: handleStop, onApply: handleApply, onClear: handleClear, modelLoaded }
 
@@ -915,7 +1131,7 @@ function App() {
         </div>
       ` : ''}
       <header class="h-9 bg-[#1e1e1e] border-b border-[#3c3c3c] flex items-center px-4 shrink-0">
-        <span class="font-semibold text-gray-200 text-sm tracking-wide">WebCoder</span>
+        <span class="font-semibold text-gray-200 text-sm tracking-wide">Coder</span>
         <span class="text-xs text-gray-500 ml-3 hidden sm:inline">Local-First AI Editor</span>
         <div class="ml-auto flex items-center gap-3 text-xs text-gray-500">
           ${modelLoaded ? html`<span class="text-green-500">● Model Ready</span>` : ''}
@@ -950,11 +1166,25 @@ function hasWebGPU(): boolean {
 }
 
 async function hasBrowserAI(): Promise<boolean> {
-  return await checkProviderAvailability(PROVIDERS.BROWSER_AI)
+  try {
+    const detail = await getBrowserAIStatus()
+    window.__browserAiNote = detail.short
+    // 'needs-download' still counts as available: loading will trigger (and
+    // show progress for) the download.
+    return detail.status === 'available' || detail.status === 'needs-download'
+  } catch {
+    window.__browserAiNote = 'Chrome AI (not available)'
+    return false
+  }
 }
 
 async function checkAvailability() {
   window.__gpuAvailable = hasWebGPU()
+  try {
+    window.__transformersAvailable = await checkProviderAvailability(PROVIDERS.TRANSFORMERS_JS)
+  } catch {
+    window.__transformersAvailable = typeof WebAssembly !== 'undefined'
+  }
   window.__browserAiAvailable = await hasBrowserAI()
 }
 

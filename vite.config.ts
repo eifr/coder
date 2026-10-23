@@ -8,8 +8,8 @@ export default defineConfig({
     registerType: 'autoUpdate',
     includeAssets: ['icon.svg', 'icon-192.png', 'icon-512.png'],
     manifest: {
-      name: 'WebCoder',
-      short_name: 'WebCoder',
+      name: 'Coder',
+      short_name: 'Coder',
       description: 'AI coding assistant that runs entirely in your browser',
       theme_color: '#1e1e1e',
       background_color: '#1e1e1e',

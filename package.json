@@ -1,5 +1,5 @@
 {
-  "name": "web-coder",
+  "name": "coder",
   "private": true,
   "type": "module",
   "scripts": {
@@ -8,24 +8,24 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@browser-ai/core": "^2.1.13",
-    "@browser-ai/transformers-js": "^2.2.2",
-    "@browser-ai/web-llm": "^2.0.0",
-    "@huggingface/transformers": "^3.7.0",
-    "@mlc-ai/web-llm": "^0.2.84",
+    "@browser-ai/core": "^3.0.4",
+    "@browser-ai/transformers-js": "^3.0.4",
+    "@browser-ai/web-llm": "^3.0.4",
+    "@huggingface/transformers": "^4.3.1",
+    "@mlc-ai/web-llm": "^0.2.86",
     "@preact/preset-vite": "^2.10.6",
-    "ai": "^6.0.0",
+    "ai": "^7.0.150",
     "htm": "^3.1.1",
-    "monaco-editor": "^0.56.0",
-    "preact": "^10.26.0",
-    "vite-plugin-pwa": "^1.3.0"
+    "monaco-editor": "^0.57.0",
+    "preact": "^11.0.1",
+    "vite-plugin-pwa": "^2.0.0"
   },
   "devDependencies": {
-    "@tailwindcss/vite": "^4.0.0",
-    "@types/react": "^19.2.17",
-    "@webgpu/types": "^0.1.71",
-    "tailwindcss": "^4.0.0",
+    "@tailwindcss/vite": "^4.3.3",
+    "@types/react": "^19.3.0",
+    "@webgpu/types": "^0.1.74",
+    "tailwindcss": "^4.3.3",
     "typescript": "^7.0.2",
-    "vite": "^6.0.0"
+    "vite": "^8.3.5"
   }
 }
