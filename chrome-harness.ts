@@ -47,7 +47,9 @@ interface NativeMessage {
 }
 
 interface NativeToolCall {
-  callId: string
+  // Chrome is renaming `callID` to `callId`; supported builds send one of them.
+  callId?: string
+  callID?: string
   name: string
   arguments?: Record<string, unknown>
 }
@@ -78,7 +80,11 @@ function truncate(value: string, max = MAX_RESULT_CHARS): string {
 
 function getLanguageModel(): LanguageModelGlobal | undefined {
   const candidate = (globalThis as Record<string, unknown>).LanguageModel
-  if (!candidate || typeof candidate !== 'object' || !('create' in candidate)) return undefined
+  // `LanguageModel` is an interface object in Chrome (`typeof === 'function'`),
+  // not a plain object; older polyfills/mocks may expose an object. `typeof` +
+  // `in` both narrow `unknown` without an unchecked assertion.
+  if (candidate === null || (typeof candidate !== 'object' && typeof candidate !== 'function')) return undefined
+  if (!('create' in candidate)) return undefined
   if (typeof candidate.create !== 'function') return undefined
   // Reason: the Prompt API has no TypeScript lib here; the shape was checked
   // above and every use goes through this interface.
@@ -93,8 +99,10 @@ function isNativeContent(chunk: unknown): chunk is NativeContent {
 
 function isToolCall(value: unknown): value is NativeToolCall {
   if (!value || typeof value !== 'object') return false
-  if (!('callId' in value) || typeof value.callId !== 'string') return false
   if (!('name' in value) || typeof value.name !== 'string') return false
+  const hasCallId = 'callId' in value && typeof value.callId === 'string'
+  const hasLegacyCallId = 'callID' in value && typeof value.callID === 'string'
+  if (!hasCallId && !hasLegacyCallId) return false
   if ('arguments' in value && value.arguments !== undefined) {
     if (!value.arguments || typeof value.arguments !== 'object') return false
   }
@@ -147,11 +155,14 @@ function makeToolResponse(call: NativeToolCall, ok: boolean, text: string): unkn
   const globals = globalThis as Record<string, unknown>
   const Success = globals.LanguageModelToolSuccess as ToolResponseConstructor | undefined
   const Failure = globals.LanguageModelToolError as ToolResponseConstructor | undefined
+  // Constructors ignore members they do not know, so passing both spellings
+  // works on builds before and after the `callID` → `callId` rename.
+  const callId = call.callId ?? call.callID ?? ''
   if (ok) {
-    const init = { callId: call.callId, name: call.name, result: [{ type: 'text', value: text }] }
+    const init = { callId, callID: callId, name: call.name, result: [{ type: 'text', value: text }] }
     return Success ? new Success(init) : init
   }
-  const init = { callId: call.callId, name: call.name, errorMessage: text }
+  const init = { callId, callID: callId, name: call.name, errorMessage: text }
   return Failure ? new Failure(init) : init
 }
 
