@@ -250,20 +250,28 @@ Rules:
 const TOOL_SYSTEM_PROMPT = `${SYSTEM_PROMPT}
 
 You can inspect and modify the user's local project with tools:
-- listFiles: list project file paths (optionally filter by directory or filename substring)
-- searchFiles: case-insensitive search in file contents
-- readFile: read a file, optionally a 1-based line range
-- createFile: create a new file
-- editFile: overwrite an existing file (fails if missing)
-- replaceInFile: replace an exact snippet in an existing file
-- deleteFile: delete a file
+- listFiles / searchFiles: find files and symbols
+- readFile: read a file (required before any edit)
+- createFile: create a new file (fails if it already exists)
+- replaceInFile: replace one exact, unique snippet (preferred edit)
+- editFile: rewrite a whole file (last resort)
+- deleteFile: remove a file (only when explicitly asked)
 
-Rules for tool use:
-1. Find relevant files first (listFiles/searchFiles), then read them before editing.
-2. Paths are relative to the project root. Never invent file contents.
-3. Make minimal, complete edits; prefer replaceInFile over rewriting a whole file; verify the result when practical.
-4. If a tool returns an error, adapt instead of repeating the same call.
-5. When done, summarize exactly what changed and where.`
+Work carefully, in this order:
+1. Understand the request. If it is ambiguous, or the change would remove data, ask a short question first instead of guessing.
+2. Locate the relevant files with listFiles/searchFiles.
+3. Read every file you intend to change with readFile. Never edit a file you have not read in this turn, never reconstruct code from memory, and never invent APIs.
+4. Make the smallest change that satisfies the request. Prefer replaceInFile with a unique snippet. Keep unrelated code, formatting, imports, and comments exactly as they are.
+5. After each edit, re-read the changed range to confirm it matches the intent.
+6. Only call deleteFile when the user explicitly asked to delete that file.
+7. If a tool returns an error, adapt; do not repeat the same call unchanged.
+
+Rules:
+- Paths are relative to the project root. Never use absolute paths or "..".
+- Never modify .git or node_modules.
+- Do not refactor, rename, or reformat code the request did not ask about.
+- If you run low on context or are unsure, stop editing and explain what is left.
+- When done, list exactly which files changed and what changed in each.`
 
 let editor: any = null
 let currentFilePath: string | null = null
@@ -407,7 +415,20 @@ async function ensureIndexed(): Promise<void> {
   if (indexPromise) await indexPromise
 }
 
+/** Rejects model-supplied paths that escape the opened project. */
+function safeProjectPath(path: string): string | null {
+  const slashed = String(path ?? '').replace(/\\/g, '/').trim()
+  if (!slashed || slashed.startsWith('/') || /^[a-zA-Z]:\//.test(slashed)) return null
+  const segments = slashed.split('/').filter(segment => segment !== '' && segment !== '.')
+  if (segments.length === 0 || segments.includes('..')) return null
+  if (segments.some(segment => segment === '.git' || segment === 'node_modules')) return null
+  return segments.join('/')
+}
+
 async function resolveFileHandle(path: string): Promise<FileSystemFileHandle | null> {
+  const safe = safeProjectPath(path)
+  if (!safe) return null
+  path = safe
   const cached = fileHandles.get(path)
   if (cached) return cached.handle as FileSystemFileHandle
   if (!rootDirHandle) return null
@@ -495,6 +516,9 @@ async function saveFile(path?: string): Promise<boolean> {
 }
 
 async function applyFileChanges(path: string, code: string): Promise<boolean> {
+  const safe = safeProjectPath(path)
+  if (!safe) return false
+  path = safe
   let entry = fileHandles.get(path)
   if (!entry) {
     if (!rootDirHandle) return false
@@ -858,6 +882,9 @@ async function readFileForTool(path: string): Promise<string | null> {
 }
 
 async function createFileForTool(path: string, content: string): Promise<boolean> {
+  const safe = safeProjectPath(path)
+  if (!safe) return false
+  path = safe
   if (fileHandles.has(path)) return false
   if (!rootDirHandle) return false
   const parts = path.split('/')
@@ -884,6 +911,9 @@ async function createFileForTool(path: string, content: string): Promise<boolean
 }
 
 async function deleteFileForTool(path: string): Promise<boolean> {
+  const safe = safeProjectPath(path)
+  if (!safe) return false
+  path = safe
   if (!rootDirHandle) return false
   try {
     const parts = path.split('/')
@@ -2074,17 +2104,24 @@ function App() {
         : createTools(readFileForTool, applyFileChanges, createFileForTool, deleteFileForTool)
     }
 
-    // Without tools Chrome cannot inspect files, so keep the open file in the
-    // prompt (also used by the harness if native tool use is unavailable).
-    if (isChromeAI && !attachContext && currentFilePath && editor) {
+    // Chrome's on-device model has a small context window and no project-wide
+    // memory, so seed every turn with the open file. Without tools it needs the
+    // contents; with tools this saves an extra readFile round trip.
+    let openFileBlock = ''
+    if (isChromeAI && currentFilePath && editor) {
       const model = editor.getModel()
       if (model) {
-        plainSystem += `\n\nCurrent open file: ${currentFilePath}\n\`\`\`\n${model.getValue()}\n\`\`\``
+        let code = model.getValue()
+        if (code.length > 8000) {
+          code = `${code.slice(0, 8000)}\n…[truncated ${code.length - 8000} characters; use readFile for the rest]`
+        }
+        openFileBlock = `\n\nCurrent open file: ${currentFilePath}\n\`\`\`\n${code}\n\`\`\``
+        plainSystem += openFileBlock
       }
     }
 
     const systemMsg = attachContext
-      ? (fileTree ? `${TOOL_SYSTEM_PROMPT}\n\nProject file tree:\n${fileTree}` : TOOL_SYSTEM_PROMPT)
+      ? (fileTree ? `${TOOL_SYSTEM_PROMPT}\n\nProject file tree:\n${fileTree}${openFileBlock}` : `${TOOL_SYSTEM_PROMPT}${openFileBlock}`)
       : plainSystem
 
     try {

@@ -386,12 +386,46 @@ function normalizePath(path: unknown): string {
   return String(path ?? '').replace(/\\/g, '/').replace(/^\.?\//, '').replace(/\/+$/, '')
 }
 
+const MAX_WRITE_CHARS = 512_000
+const PROTECTED_DIRS: Record<string, true> = { '.git': true, node_modules: true }
+
+type PathCheck = { path: string } | { error: string }
+
+/**
+ * Validates a model-supplied path. The tool layer is the trust boundary: a
+ * small on-device model will happily emit `../`, absolute paths, or `.git/…`,
+ * and the File System Access API must never see them.
+ */
+function checkProjectPath(value: unknown): PathCheck {
+  const raw = String(value ?? '').trim()
+  if (!raw) return { error: 'path is required' }
+  if (raw.includes('\u0000')) return { error: 'Invalid path.' }
+  const slashed = raw.replace(/\\/g, '/')
+  if (slashed.startsWith('/') || /^[a-zA-Z]:\//.test(slashed)) {
+    return { error: `Use a path relative to the project root, not an absolute path: ${raw}` }
+  }
+  const segments = normalizePath(slashed).split('/').filter(segment => segment !== '.' && segment !== '')
+  if (segments.length === 0) return { error: 'path is required' }
+  if (segments.includes('..')) {
+    return { error: `Refusing a path outside the project root: ${raw}` }
+  }
+  if (segments.some(segment => PROTECTED_DIRS[segment] === true)) {
+    return { error: `Refusing to touch protected directories (${Object.keys(PROTECTED_DIRS).join(', ')}): ${raw}` }
+  }
+  return { path: segments.join('/') }
+}
+
 export function createHarnessTools(fs: HarnessFs): HarnessTool[] {
-  const filesUnder = async (prefix: unknown) => {
-    const base = normalizePath(prefix)
+  // Files the model has read (or written) this turn. Mutations require a prior
+  // read so the model cannot rewrite code it has never seen.
+  const clearedForEdit = new Set<string>()
+  const ensureRead = (path: string) => clearedForEdit.has(path)
+    ? null
+    : `Read "${path}" with readFile before editing or deleting it.`
+  const filesUnder = async (prefix: string) => {
     const all = (await fs.listFiles()).slice().sort()
-    if (!base) return all
-    return all.filter(path => path === base || path.startsWith(`${base}/`))
+    if (!prefix) return all
+    return all.filter(path => path === prefix || path.startsWith(`${prefix}/`))
   }
 
   return [
@@ -407,8 +441,11 @@ export function createHarnessTools(fs: HarnessFs): HarnessTool[] {
         required: [],
       },
       execute: async ({ path, query }) => {
+        const dir = String(path ?? '').trim()
+        const check = dir ? checkProjectPath(dir) : { path: '' }
+        if ('error' in check) return { error: check.error }
         const needle = String(query ?? '').toLowerCase()
-        const matches = (await filesUnder(path)).filter(file => !needle || file.toLowerCase().includes(needle))
+        const matches = (await filesUnder(check.path)).filter(file => !needle || file.toLowerCase().includes(needle))
         return {
           count: matches.length,
           files: matches.slice(0, MAX_LISTED_FILES),
@@ -428,13 +465,16 @@ export function createHarnessTools(fs: HarnessFs): HarnessTool[] {
         required: ['query'],
       },
       execute: async ({ query, path }) => {
+        const dir = String(path ?? '').trim()
+        const check = dir ? checkProjectPath(dir) : { path: '' }
+        if ('error' in check) return { error: check.error }
         const needle = String(query ?? '').toLowerCase()
         if (!needle) return { error: 'query is required' }
         const matches: Array<{ path: string; line: number; text: string }> = []
         let scanned = 0
         let scannedFiles = 0
         let truncated = false
-        for (const file of await filesUnder(path)) {
+        for (const file of await filesUnder(check.path)) {
           if (scannedFiles >= MAX_SEARCH_FILES || scanned >= MAX_SEARCH_BYTES) {
             truncated = true
             break
@@ -459,7 +499,7 @@ export function createHarnessTools(fs: HarnessFs): HarnessTool[] {
     },
     {
       name: 'readFile',
-      description: 'Read a project file. Always read before editing. Optionally pass a 1-based line range for large files (max 600 lines / 24000 characters per call).',
+      description: 'Read a project file. Required before replaceInFile, editFile, or deleteFile. Optionally pass a 1-based line range for large files (max 600 lines / 24000 characters per call).',
       inputSchema: {
         type: 'object',
         properties: {
@@ -470,9 +510,12 @@ export function createHarnessTools(fs: HarnessFs): HarnessTool[] {
         required: ['path'],
       },
       execute: async ({ path, startLine, endLine }) => {
-        const file = normalizePath(path)
+        const check = checkProjectPath(path)
+        if ('error' in check) return { error: check.error }
+        const file = check.path
         const content = await fs.readFile(file)
         if (content == null) return { error: `File not found: ${file}` }
+        clearedForEdit.add(file)
         const lines = content.split('\n')
         const totalLines = lines.length
         let start = typeof startLine === 'number' && Number.isFinite(startLine) ? Math.max(1, Math.floor(startLine)) : 1
@@ -500,15 +543,21 @@ export function createHarnessTools(fs: HarnessFs): HarnessTool[] {
         required: ['path', 'content'],
       },
       execute: async ({ path, content }) => {
-        const file = normalizePath(path)
-        if (!file) return { error: 'path is required' }
-        const ok = await fs.createFile(file, String(content ?? ''))
+        const check = checkProjectPath(path)
+        if ('error' in check) return { error: check.error }
+        const file = check.path
+        const body = String(content ?? '')
+        if (body.length > MAX_WRITE_CHARS) {
+          return { error: `Refusing to write ${body.length} characters (limit ${MAX_WRITE_CHARS}). Split the change into smaller edits.` }
+        }
+        const ok = await fs.createFile(file, body)
+        if (ok) clearedForEdit.add(file)
         return ok ? { path: file, created: true } : { error: `Failed to create ${file} (it may already exist)` }
       },
     },
     {
       name: 'replaceInFile',
-      description: 'Replace an exact text snippet in an existing file. Fails when oldText is missing or matches more than once unless replaceAll is true. Prefer this over editFile for small changes.',
+      description: 'Preferred edit tool. Replaces one exact snippet in a file you have already read this turn. Fails when oldText is missing or matches more than once unless replaceAll is true. Keep oldText large enough to be unique and include surrounding context.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -520,9 +569,12 @@ export function createHarnessTools(fs: HarnessFs): HarnessTool[] {
         required: ['path', 'oldText', 'newText'],
       },
       execute: async ({ path, oldText, newText, replaceAll }) => {
-        const file = normalizePath(path)
+        const check = checkProjectPath(path)
+        if ('error' in check) return { error: check.error }
+        const file = check.path
+        const guard = ensureRead(file)
+        if (guard) return { error: guard }
         const needle = String(oldText ?? '')
-        if (!file) return { error: 'path is required' }
         if (!needle) return { error: 'oldText is required' }
         const content = await fs.readFile(file)
         if (content == null) return { error: `File not found: ${file}` }
@@ -535,13 +587,16 @@ export function createHarnessTools(fs: HarnessFs): HarnessTool[] {
         const next = replaceAll === true
           ? content.split(needle).join(replacement)
           : content.slice(0, content.indexOf(needle)) + replacement + content.slice(content.indexOf(needle) + needle.length)
+        if (next.length > MAX_WRITE_CHARS) {
+          return { error: `Refusing to write ${next.length} characters (limit ${MAX_WRITE_CHARS}). Split the change into smaller edits.` }
+        }
         const ok = await fs.writeFile(file, next)
         return ok ? { path: file, replacements: replaceAll === true ? count : 1 } : { error: `Failed to write ${file}` }
       },
     },
     {
       name: 'editFile',
-      description: 'Replace the entire contents of an existing file. Read the file first. Fails if the file does not exist; use createFile for new files.',
+      description: 'Last resort: replaces the entire contents of an existing file. Requires a prior readFile this turn and refuses empty content. Use replaceInFile whenever possible; use createFile for new files.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -551,16 +606,26 @@ export function createHarnessTools(fs: HarnessFs): HarnessTool[] {
         required: ['path', 'content'],
       },
       execute: async ({ path, content }) => {
-        const file = normalizePath(path)
-        if (!file) return { error: 'path is required' }
+        const check = checkProjectPath(path)
+        if ('error' in check) return { error: check.error }
+        const file = check.path
+        const guard = ensureRead(file)
+        if (guard) return { error: guard }
+        const body = String(content ?? '')
+        if (!body.trim()) {
+          return { error: `Refusing to replace ${file} with empty content; use deleteFile if the file should be removed.` }
+        }
+        if (body.length > MAX_WRITE_CHARS) {
+          return { error: `Refusing to write ${body.length} characters (limit ${MAX_WRITE_CHARS}). Split the change into smaller edits.` }
+        }
         if (await fs.readFile(file) == null) return { error: `File not found: ${file}. Use createFile for new files.` }
-        const ok = await fs.writeFile(file, String(content ?? ''))
+        const ok = await fs.writeFile(file, body)
         return ok ? { path: file, written: true } : { error: `Failed to write ${file}` }
       },
     },
     {
       name: 'deleteFile',
-      description: 'Delete a file from the project.',
+      description: 'Delete a file. Requires a prior readFile this turn, and should only be used when the user explicitly asked to delete that file.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -569,8 +634,11 @@ export function createHarnessTools(fs: HarnessFs): HarnessTool[] {
         required: ['path'],
       },
       execute: async ({ path }) => {
-        const file = normalizePath(path)
-        if (!file) return { error: 'path is required' }
+        const check = checkProjectPath(path)
+        if ('error' in check) return { error: check.error }
+        const file = check.path
+        const guard = ensureRead(file)
+        if (guard) return { error: guard }
         const ok = await fs.deleteFile(file)
         return ok ? { path: file, deleted: true } : { error: `Failed to delete ${file}` }
       },
