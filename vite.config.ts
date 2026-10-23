@@ -6,21 +6,22 @@ import { VitePWA } from 'vite-plugin-pwa'
 export default defineConfig({
   plugins: [preact(), tailwindcss(), VitePWA({
     registerType: 'autoUpdate',
-    includeAssets: ['icon.svg', 'icon-192.png', 'icon-512.png'],
+    includeAssets: ['icon.svg', 'icon-192.png', 'icon-512.png', 'icon-maskable-192.png', 'icon-maskable-512.png'],
     manifest: {
       name: 'Coder',
       short_name: 'Coder',
       description: 'AI coding assistant that runs entirely in your browser',
-      theme_color: '#1e1e1e',
-      background_color: '#1e1e1e',
+      theme_color: '#0e1015',
+      background_color: '#0e1015',
       display: 'standalone',
       orientation: 'any',
       prefer_related_applications: false,
       icons: [
-        { src: 'icon.svg', sizes: '192x192', type: 'image/svg+xml', purpose: 'any' },
-        { src: 'icon.svg', sizes: '512x512', type: 'image/svg+xml', purpose: 'any' },
-        { src: 'icon-192.png', sizes: '192x192', type: 'image/png', purpose: 'any maskable' },
-        { src: 'icon-512.png', sizes: '512x512', type: 'image/png', purpose: 'any maskable' }
+        { src: 'icon.svg', sizes: 'any', type: 'image/svg+xml', purpose: 'any' },
+        { src: 'icon-192.png', sizes: '192x192', type: 'image/png', purpose: 'any' },
+        { src: 'icon-512.png', sizes: '512x512', type: 'image/png', purpose: 'any' },
+        { src: 'icon-maskable-192.png', sizes: '192x192', type: 'image/png', purpose: 'maskable' },
+        { src: 'icon-maskable-512.png', sizes: '512x512', type: 'image/png', purpose: 'maskable' }
       ]
     },
     workbox: {

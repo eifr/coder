@@ -407,8 +407,41 @@ export function createHarnessTools(fs: HarnessFs): HarnessTool[] {
       },
     },
     {
+      name: 'replaceInFile',
+      description: 'Replace an exact text snippet in an existing file. Fails when oldText is missing or matches more than once unless replaceAll is true. Prefer this over editFile for small changes.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'File path relative to the project root.' },
+          oldText: { type: 'string', description: 'Exact text to replace, including surrounding context to make it unique.' },
+          newText: { type: 'string', description: 'Replacement text.' },
+          replaceAll: { type: 'boolean', description: 'Replace every occurrence. Defaults to false.' },
+        },
+        required: ['path', 'oldText', 'newText'],
+      },
+      execute: async ({ path, oldText, newText, replaceAll }) => {
+        const file = normalizePath(path)
+        const needle = String(oldText ?? '')
+        if (!file) return { error: 'path is required' }
+        if (!needle) return { error: 'oldText is required' }
+        const content = await fs.readFile(file)
+        if (content == null) return { error: `File not found: ${file}` }
+        const replacement = String(newText ?? '')
+        const count = content.split(needle).length - 1
+        if (count === 0) return { error: `oldText was not found in ${file}` }
+        if (count > 1 && replaceAll !== true) {
+          return { error: `oldText matches ${count} times in ${file}; add surrounding context or set replaceAll to true` }
+        }
+        const next = replaceAll === true
+          ? content.split(needle).join(replacement)
+          : content.slice(0, content.indexOf(needle)) + replacement + content.slice(content.indexOf(needle) + needle.length)
+        const ok = await fs.writeFile(file, next)
+        return ok ? { path: file, replacements: replaceAll === true ? count : 1 } : { error: `Failed to write ${file}` }
+      },
+    },
+    {
       name: 'editFile',
-      description: 'Replace the entire contents of an existing file. Read the file first. Creates the file (and parent directories) if it does not exist.',
+      description: 'Replace the entire contents of an existing file. Read the file first. Fails if the file does not exist; use createFile for new files.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -420,6 +453,7 @@ export function createHarnessTools(fs: HarnessFs): HarnessTool[] {
       execute: async ({ path, content }) => {
         const file = normalizePath(path)
         if (!file) return { error: 'path is required' }
+        if (await fs.readFile(file) == null) return { error: `File not found: ${file}. Use createFile for new files.` }
         const ok = await fs.writeFile(file, String(content ?? ''))
         return ok ? { path: file, written: true } : { error: `Failed to write ${file}` }
       },

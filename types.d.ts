@@ -6,6 +6,13 @@ declare module 'htm/preact/standalone.mjs' {
   export function useRef<T>(initial: T): { current: T }
   export function useCallback<T extends Function>(fn: T, deps: any[]): T
   export function useMemo<T>(fn: () => T, deps: any[]): T
+  export class Component<P = {}, S = {}> {
+    constructor(props: P)
+    props: P
+    state: S
+    setState(state: Partial<S> | ((prev: S, props: P) => Partial<S>)): void
+    render(): any
+  }
 }
 
 declare module '*?worker' {

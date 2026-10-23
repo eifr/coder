@@ -1,5 +1,5 @@
-import { html, render, useState, useEffect, useRef, useCallback, useMemo } from 'htm/preact/standalone.mjs'
-import { PROVIDERS, getAvailableModels, estimateVRAM, getPreferredModel, checkProviderAvailability, getBrowserAIStatus, initProviderModel, createChatStream, createTools, type Provider, type ModelDescriptor } from './llm-provider'
+import { html, render, Component, useState, useEffect, useRef, useCallback, useMemo } from 'htm/preact/standalone.mjs'
+import { PROVIDERS, getAvailableModels, estimateVRAM, getPreferredModel, checkProviderAvailability, getBrowserAIStatus, getBuiltInAICapabilities, initProviderModel, createChatStream, createTools, type Provider, type ModelDescriptor, type BuiltInApiInfo, type BuiltInApiStatus } from './llm-provider'
 import { createHarnessTools, streamChromeHarness, type HarnessTool } from './chrome-harness'
 import type { LanguageModel, ModelMessage } from 'ai'
 
@@ -14,10 +14,11 @@ const notifications: Notification[] = []
 const notificationListeners: Array<() => void> = []
 
 function addNotification(text: string, level: Notification['level'] = 'info') {
-  notifications.push({ id: ++notificationId, text, level })
+  const id = ++notificationId
+  notifications.push({ id, text, level })
   notificationListeners.forEach(fn => fn())
   setTimeout(() => {
-    const idx = notifications.findIndex(n => n.id === notificationId)
+    const idx = notifications.findIndex(n => n.id === id)
     if (idx >= 0) {
       notifications.splice(idx, 1)
       notificationListeners.forEach(fn => fn())
@@ -69,6 +70,7 @@ interface ChatChunk {
   done: boolean
   delta: string
   usage: unknown
+  tool?: { name: string; path?: string; ok?: boolean }
 }
 
 declare global {
@@ -119,16 +121,18 @@ function clearState() {
   try { localStorage.removeItem(STORAGE_KEY) } catch {}
 }
 
+function loadWidth(key: string, fallback: number): number {
+  try {
+    const raw = localStorage.getItem(key)
+    const value = raw ? Number(raw) : NaN
+    return Number.isFinite(value) ? value : fallback
+  } catch {
+    return fallback
+  }
+}
+
 const EXCLUDED = new Set(['node_modules','.git','dist','.DS_Store','__pycache__','.next','.vscode','build','.cache','.venv','venv','env','.idea','coverage','.nyc_output'])
 const MAX_DEPTH = 8
-const MAX_CONTEXT_FILES = 8
-const MAX_CONTEXT_FILE_SIZE = 1500
-// Suppress AI SDK warnings (toolChoice not supported by WebLLM is expected)
-globalThis.AI_SDK_LOG_WARNINGS = false
-
-// Suppress AI SDK warnings (toolChoice not supported by WebLLM is expected)
-globalThis.AI_SDK_LOG_WARNINGS = false
-
 // Suppress AI SDK warnings (toolChoice not supported by WebLLM is expected)
 globalThis.AI_SDK_LOG_WARNINGS = false
 
@@ -179,6 +183,52 @@ const LANG_MAP: Record<string, string> = {
   '.wasm':'plaintext','.lock':'plaintext',
 }
 
+/* Inline icon set. Stroke icons inherit `currentColor`; only the mark keeps
+ * fixed brand colors (it mirrors public/icon.svg). */
+function Logo({ class: cls = 'w-6 h-6' }: { class?: string }) {
+  return html`<svg viewBox="0 0 32 32" class=${cls} aria-hidden="true">
+    <rect x="0.75" y="0.75" width="30.5" height="30.5" rx="7.25" fill="#13161d" stroke="#343d4d" stroke-width="1.5" />
+    <path d="M13 10.5 7.5 16 13 21.5" fill="none" stroke="#e4e8f0" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" />
+    <path d="M19 10.5 24.5 16 19 21.5" fill="none" stroke="#e4e8f0" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" />
+    <rect x="14.7" y="11" width="2.6" height="10" rx="1.3" fill="#f4b860" />
+  </svg>`
+}
+
+function Chevron({ open, class: cls = 'w-3 h-3' }: { open: boolean; class?: string }) {
+  return html`<svg viewBox="0 0 16 16" class=${`${cls} shrink-0 transition-transform duration-150 ${open ? 'rotate-90' : ''}`} fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3.5 10.5 8 6 12.5" /></svg>`
+}
+
+function FolderIcon({ open = false, class: cls = 'w-3.5 h-3.5' }: { open?: boolean; class?: string }) {
+  const d = open
+    ? 'm6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2'
+    : 'M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z'
+  return html`<svg viewBox="0 0 24 24" class=${cls} fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d=${d} /></svg>`
+}
+
+function FileIcon({ class: cls = 'w-3.5 h-3.5' }: { class?: string }) {
+  return html`<svg viewBox="0 0 24 24" class=${cls} fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><path d="M14 2v6h6" /></svg>`
+}
+
+function FolderPlusIcon({ class: cls = 'w-3.5 h-3.5' }: { class?: string }) {
+  return html`<svg viewBox="0 0 24 24" class=${cls} fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z" /><path d="M12 11v6M9 14h6" /></svg>`
+}
+
+function CheckIcon({ class: cls = 'w-3 h-3' }: { class?: string }) {
+  return html`<svg viewBox="0 0 24 24" class=${cls} fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 12 4 4L19 6" /></svg>`
+}
+
+function ChatIcon({ class: cls = 'w-3.5 h-3.5' }: { class?: string }) {
+  return html`<svg viewBox="0 0 24 24" class=${cls} fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" /></svg>`
+}
+
+function SparkIcon({ class: cls = 'w-3.5 h-3.5' }: { class?: string }) {
+  return html`<svg viewBox="0 0 24 24" class=${cls} fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.5 13.9 9l5.6 1.9-5.6 1.9L12 18.4l-1.9-5.6L4.5 10.9 10.1 9z" /><path d="M19 15.5v3M20.5 17h-3" /></svg>`
+}
+
+function SearchIcon({ class: cls = 'w-3.5 h-3.5' }: { class?: string }) {
+  return html`<svg viewBox="0 0 24 24" class=${cls} fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7" /><path d="m20 20-3.6-3.6" /></svg>`
+}
+
 const SYSTEM_PROMPT = `You are Coder, an AI coding assistant running entirely inside the user's browser. All computation is local and private.
 
 When file tools are not available, suggest code changes with a code block that includes the file path header like this:
@@ -201,13 +251,14 @@ You can inspect and modify the user's local project with tools:
 - searchFiles: case-insensitive search in file contents
 - readFile: read a file, optionally a 1-based line range
 - createFile: create a new file
-- editFile: overwrite an existing file (creates it if missing)
+- editFile: overwrite an existing file (fails if missing)
+- replaceInFile: replace an exact snippet in an existing file
 - deleteFile: delete a file
 
 Rules for tool use:
 1. Find relevant files first (listFiles/searchFiles), then read them before editing.
 2. Paths are relative to the project root. Never invent file contents.
-3. Make minimal, complete edits; verify the result when practical.
+3. Make minimal, complete edits; prefer replaceInFile over rewriting a whole file; verify the result when practical.
 4. If a tool returns an error, adapt instead of repeating the same call.
 5. When done, summarize exactly what changed and where.`
 
@@ -218,11 +269,43 @@ let rootDirHandle: FileSystemDirectoryHandle | null = null
 let rootDirName = ''
 const fileHandles = new Map<string, FileEntry>()
 const monacoModels = new Map<string, any>()
-let editorContentVersion = 0
-let autoSaveTimer: ReturnType<typeof setTimeout> | null = null
 let currentModel: LanguageModel | null = null
 let abortController: AbortController | null = null
 let modelLoadPromise: Promise<LanguageModel> | null = null
+let onFileSaved: ((path: string) => void) | null = null
+let onFileOpened: ((path: string) => void) | null = null
+let onFileDirtyChanged: ((path: string, dirty: boolean) => void) | null = null
+const savedContents = new Map<string, string>()
+
+interface EditorRange {
+  startLineNumber: number
+  startColumn: number
+  endLineNumber: number
+  endColumn: number
+}
+
+interface BuiltInActionRequest {
+  kind: 'summarize' | 'summarize-file' | 'translate' | 'proofread' | 'rewrite'
+  text: string
+  range?: EditorRange
+  path?: string
+}
+
+type SelectionActionKind = 'explain' | 'refactor' | 'tests'
+let onSelectionAction: ((kind: SelectionActionKind, text: string, path: string | null) => void) | null = null
+
+let onBuiltInAction: ((request: BuiltInActionRequest) => void) | null = null
+
+function hasBuiltInApi(name: string): boolean {
+  const globals = globalThis as unknown as Record<string, unknown>
+  return typeof globals[name] === 'function'
+}
+
+function replaceEditorRange(range: EditorRange | undefined, text: string): void {
+  if (!editor || !range) return
+  editor.executeEdits('coder-built-in-ai', [{ range, text, forceMoveMarkers: true }])
+  editor.focus()
+}
 
 async function verifyPermission(fileHandle: FileSystemHandle, readWrite = false): Promise<boolean> {
   const options: FileSystemHandlePermissionDescriptor = {}
@@ -243,6 +326,11 @@ async function writeFileContent(fileHandle: FileSystemFileHandle, content: strin
   await writable.close()
 }
 
+const compareEntries = (a: FileEntry, b: FileEntry): number => {
+  if (a.type !== b.type) return a.type === 'dir' ? -1 : 1
+  return a.name.localeCompare(b.name)
+}
+
 /** Enumerates one directory level. Child directories stay unloaded until expanded. */
 async function readDirEntries(dirHandle: FileSystemDirectoryHandle, path = '', generation = folderGeneration): Promise<FileEntry[]> {
   const entries: FileEntry[] = []
@@ -257,10 +345,7 @@ async function readDirEntries(dirHandle: FileSystemDirectoryHandle, path = '', g
       if (generation === folderGeneration) fileHandles.set(entryPath, entry)
     }
   }
-  entries.sort((a, b) => {
-    if (a.type !== b.type) return a.type === 'dir' ? -1 : 1
-    return a.name.localeCompare(b.name)
-  })
+  entries.sort(compareEntries)
   return entries
 }
 
@@ -369,15 +454,21 @@ async function loadFile(path: string): Promise<string | null> {
     const content = await readFileContent(handle)
     currentFilePath = path
     currentFileHandle = handle
+    savedContents.set(path, content)
     if (monacoModels.has(path)) {
       const m = monacoModels.get(path)
       if (m.getValue() !== content) m.setValue(content)
       editor.setModel(m)
     } else {
       const model = monaco.editor.createModel(content, getLanguage(path))
+      model.onDidChangeContent(() => {
+        onFileDirtyChanged?.(path, savedContents.get(path) !== model.getValue())
+      })
       monacoModels.set(path, model)
       editor.setModel(model)
     }
+    onFileOpened?.(path)
+    onFileDirtyChanged?.(path, false)
     return path
   } catch (err) {
     console.error('loadFile:', err)
@@ -393,6 +484,9 @@ async function saveFile(path?: string): Promise<boolean> {
   if (!await verifyPermission(handle, true)) { alert(`Cannot write ${targetPath}`); return false }
   try {
     await writeFileContent(handle, editor.getValue())
+    savedContents.set(targetPath, editor.getValue())
+    onFileDirtyChanged?.(targetPath, false)
+    onFileSaved?.(targetPath)
     return true
   } catch (err) { console.error('saveFile:', err); return false }
 }
@@ -415,6 +509,7 @@ async function applyFileChanges(path: string, code: string): Promise<boolean> {
   if (!entry || !await verifyPermission(entry.handle, true)) return false
   try {
     await writeFileContent(entry.handle as FileSystemFileHandle, code)
+    savedContents.set(path, code)
     if (monacoModels.has(path)) {
       const model = monacoModels.get(path)
       if (model !== editor.getModel()) model.setValue(code)
@@ -422,24 +517,135 @@ async function applyFileChanges(path: string, code: string): Promise<boolean> {
     } else if (path === currentFilePath) {
       editor.setValue(code)
     }
+    onFileDirtyChanged?.(path, false)
     return true
   } catch { return false }
 }
 
 function initMonaco(container: HTMLElement): Promise<monaco.editor.IStandaloneCodeEditor> {
-  return new Promise((resolve) => {
-    const ed = monaco.editor.create(container, {
-      value: '', language: 'plaintext', theme: 'vs-dark',
-      automaticLayout: true, minimap: { enabled: false }, fontSize: 14,
-      lineNumbers: 'on', scrollBeyondLastLine: false, tabSize: 2,
-      wordWrap: 'off', padding: { top: 8 },
-      bracketPairColorization: { enabled: true },
-    })
-    ed.onDidChangeModelContent(() => { editorContentVersion++ })
-    ed.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, async () => { await saveFile() })
-    editor = ed
-    resolve(ed)
+  const { promise, resolve } = Promise.withResolvers<monaco.editor.IStandaloneCodeEditor>()
+  monaco.editor.defineTheme('coder-dark', {
+    base: 'vs-dark',
+    inherit: true,
+    rules: [{ token: '', foreground: 'e4e8f0' }],
+    colors: {
+      'editor.background': '#0e1015',
+      'editor.foreground': '#e4e8f0',
+      'editorLineNumber.foreground': '#4b5468',
+      'editorLineNumber.activeForeground': '#9aa4b8',
+      'editor.lineHighlightBackground': '#151922',
+      'editor.selectionBackground': '#2a3550',
+      'editorCursor.foreground': '#f4b860',
+      'editorIndentGuide.background1': '#1d222c',
+      'editorGutter.background': '#0e1015',
+      'minimap.background': '#0e1015',
+    },
   })
+  const ed = monaco.editor.create(container, {
+    value: '', language: 'plaintext', theme: 'coder-dark',
+    automaticLayout: true, minimap: { enabled: false }, fontSize: 13,
+    lineNumbers: 'on', scrollBeyondLastLine: false, tabSize: 2,
+    wordWrap: 'off', padding: { top: 10 },
+    bracketPairColorization: { enabled: true },
+  })
+  ed.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, async () => { await saveFile() })
+
+  const readSelection = (): { text: string; range: EditorRange } | null => {
+    const model = ed.getModel()
+    const selection = ed.getSelection()
+    if (!model || !selection || selection.isEmpty()) return null
+    return {
+      text: model.getValueInRange(selection),
+      range: {
+        startLineNumber: selection.startLineNumber,
+        startColumn: selection.startColumn,
+        endLineNumber: selection.endLineNumber,
+        endColumn: selection.endColumn,
+      },
+    }
+  }
+
+  // These actions only exist when the browser exposes the task API, so the
+  // context menu never advertises an action that cannot run.
+  if (hasBuiltInApi('Summarizer')) {
+    ed.addAction({
+      id: 'coder.summarizeSelection',
+      label: '✦ Summarize selection',
+      precondition: 'editorHasSelection',
+      contextMenuGroupId: '1_modification',
+      contextMenuOrder: 1.5,
+      run: () => {
+        const selection = readSelection()
+        if (selection) onBuiltInAction?.({ kind: 'summarize', ...selection })
+      },
+    })
+  }
+  if (hasBuiltInApi('Translator')) {
+    ed.addAction({
+      id: 'coder.translateSelection',
+      label: '✦ Translate selection',
+      precondition: 'editorHasSelection',
+      contextMenuGroupId: '1_modification',
+      contextMenuOrder: 1.6,
+      run: () => {
+        const selection = readSelection()
+        if (selection) onBuiltInAction?.({ kind: 'translate', ...selection })
+      },
+    })
+  }
+  if (hasBuiltInApi('Proofreader')) {
+    ed.addAction({
+      id: 'coder.proofreadSelection',
+      label: '✦ Proofread selection',
+      precondition: 'editorHasSelection',
+      contextMenuGroupId: '1_modification',
+      contextMenuOrder: 1.7,
+      run: () => {
+        const selection = readSelection()
+        if (selection) onBuiltInAction?.({ kind: 'proofread', ...selection })
+      },
+    })
+  }
+  if (hasBuiltInApi('Rewriter')) {
+    ed.addAction({
+      id: 'coder.rewriteSelection',
+      label: '✦ Rewrite selection',
+      precondition: 'editorHasSelection',
+      contextMenuGroupId: '1_modification',
+      contextMenuOrder: 1.8,
+      run: () => {
+        const selection = readSelection()
+        if (selection) onBuiltInAction?.({ kind: 'rewrite', ...selection })
+      },
+    })
+  }
+
+  // Model-agnostic actions: they send the selection to the chat, so they work
+  // with WebLLM, Transformers.js, and Chrome built-in AI alike.
+  const selectionActions: Array<{ id: string; label: string; kind: SelectionActionKind; order: number }> = [
+    { id: 'coder.explainSelection', label: '✦ Explain selection', kind: 'explain', order: 1.9 },
+    { id: 'coder.refactorSelection', label: '✦ Refactor selection', kind: 'refactor', order: 2.0 },
+    { id: 'coder.testSelection', label: '✦ Add tests for selection', kind: 'tests', order: 2.1 },
+  ]
+  for (const action of selectionActions) {
+    ed.addAction({
+      id: action.id,
+      label: action.label,
+      precondition: 'editorHasSelection',
+      // A distinct group makes Monaco draw a separator before the
+      // model-backed actions, after the built-in AI task actions.
+      contextMenuGroupId: '2_coder',
+      contextMenuOrder: action.order,
+      run: () => {
+        const selection = readSelection()
+        if (selection) onSelectionAction?.(action.kind, selection.text, currentFilePath)
+      },
+    })
+  }
+
+  editor = ed
+  resolve(ed)
+  return promise
 }
 
 async function initLLM(provider: Provider, modelId: string, onProgress: (p: InitProgressState) => void): Promise<LanguageModel> {
@@ -467,6 +673,8 @@ async function* streamChat(messages: ModelMessage[], system?: string, plainSyste
   const provider = (currentModel as any).provider || PROVIDERS.WEBLLM
 
   if (provider === PROVIDERS.BROWSER_AI) {
+    let visible = ''
+    let lastToolPath: string | undefined
     for await (const event of streamChromeHarness({
       system: system || '',
       plainSystem: plainSystem || system || '',
@@ -476,11 +684,16 @@ async function* streamChat(messages: ModelMessage[], system?: string, plainSyste
     })) {
       if (signal?.aborted) break
       if (event.type === 'text') {
+        visible = event.text
         yield { text: event.text, done: false, delta: event.delta, usage: null }
       } else if (event.type === 'tool-call') {
+        const rawPath = typeof event.args.path === 'string' ? event.args.path : undefined
+        lastToolPath = rawPath?.replace(/\\/g, '/').replace(/^\.?\//, '').replace(/\/+$/, '')
         console.log('Tool call:', event.name, event.args)
+        yield { text: visible, done: false, delta: '', usage: null, tool: { name: event.name, path: lastToolPath } }
       } else if (event.type === 'tool-result') {
         console.log('Tool result:', event.name, event.ok ? 'ok' : 'error', event.preview)
+        yield { text: visible, done: false, delta: '', usage: null, tool: { name: event.name, path: lastToolPath, ok: event.ok } }
       } else if (event.type === 'fallback') {
         addNotification(`Chrome tool use unavailable (${event.reason}). Continuing without project tools.`, 'warning')
       } else if (event.type === 'done') {
@@ -570,6 +783,53 @@ function updateEntry(
   })
 }
 
+/** Adds a file written by a tool to the visible tree when its parent is loaded. */
+function addFileToTree(entries: FileEntry[] | null, path: string, entry: FileEntry): FileEntry[] | null {
+  if (!entries) return null
+  const parts = path.split('/')
+  const walk = (list: FileEntry[], depth: number): FileEntry[] => {
+    const name = parts[depth]
+    const leaf = depth === parts.length - 1
+    if (leaf) {
+      if (list.some(candidate => candidate.path === path)) return list
+      return [...list, entry].sort(compareEntries)
+    }
+    const index = list.findIndex(candidate => candidate.name === name && candidate.type === 'dir')
+    if (index < 0) return list
+    const dir = list[index]
+    if (!dir.loaded || !dir.children) return list
+    const children = walk(dir.children, depth + 1)
+    if (children === dir.children) return list
+    const next = list.slice()
+    next[index] = { ...dir, children }
+    return next
+  }
+  return walk(entries, 0)
+}
+
+/** Removes a file deleted by a tool from every loaded branch of the tree. */
+function removeFileFromTree(entries: FileEntry[] | null, path: string): FileEntry[] | null {
+  if (!entries) return null
+  let changed = false
+  const next: FileEntry[] = []
+  for (const entry of entries) {
+    if (entry.path === path) {
+      changed = true
+      continue
+    }
+    if (entry.children && path.startsWith(`${entry.path}/`)) {
+      const children = removeFileFromTree(entry.children, path)
+      if (children !== entry.children) {
+        changed = true
+        next.push({ ...entry, children: children ?? [] })
+        continue
+      }
+    }
+    next.push(entry)
+  }
+  return changed ? next : entries
+}
+
 function buildFileTree(treeData: FileEntry[]): string {
   const lines = [`Project: ${rootDirName}`, '']
   function flat(entries: FileEntry[], p = '') {
@@ -596,14 +856,24 @@ async function createFileForTool(path: string, content: string): Promise<boolean
   if (fileHandles.has(path)) return false
   if (!rootDirHandle) return false
   const parts = path.split('/')
-  let dirHandle = rootDirHandle
+  let dirHandle: FileSystemDirectoryHandle = rootDirHandle
   for (let i = 0; i < parts.length - 1; i++) {
     try { dirHandle = await dirHandle.getDirectoryHandle(parts[i], { create: true }) } catch { return false }
   }
+  const name = parts[parts.length - 1]
+  // Ask for the file without `create` first: with lazy indexing a file that
+  // exists on disk may not be in fileHandles yet, and `create: true` would
+  // silently return and overwrite it.
   try {
-    const fh = await dirHandle.getFileHandle(parts[parts.length - 1], { create: true })
+    await dirHandle.getFileHandle(name)
+    return false
+  } catch (err) {
+    if (!(err instanceof DOMException) || err.name !== 'NotFoundError') return false
+  }
+  try {
+    const fh = await dirHandle.getFileHandle(name, { create: true })
     await writeFileContent(fh, content)
-    fileHandles.set(path, { handle: fh, name: parts[parts.length - 1], path, type: 'file' })
+    fileHandles.set(path, { handle: fh, name, path, type: 'file' })
     return true
   } catch { return false }
 }
@@ -618,13 +888,15 @@ async function deleteFileForTool(path: string): Promise<boolean> {
     }
     await dirHandle.removeEntry(parts[parts.length - 1])
     fileHandles.delete(path)
-    if (monacoModels.has(path)) {
-      monacoModels.get(path).dispose()
-      monacoModels.delete(path)
-    }
     if (path === currentFilePath) {
       currentFilePath = null
       currentFileHandle = null
+      // Detach before disposing: the editor must not keep a disposed model.
+      editor?.setModel(null)
+    }
+    if (monacoModels.has(path)) {
+      monacoModels.get(path).dispose()
+      monacoModels.delete(path)
     }
     return true
   } catch { return false }
@@ -651,9 +923,10 @@ interface SidebarProps {
   onCustomModel: (url: string) => void
   selectedProvider: Provider
   onProviderChange: (provider: Provider) => void
+  onShowBuiltInAI: () => void
 }
 
-function Sidebar({ treeData, indexedCount, expandedPaths, onToggleDir, onFileClick, selectedFile, modelList, selectedModel, onModelChange, modelLoaded, modelLoading, initProgress, onLoadModel, onOpenFolder, attachContext, onAttachContextChange, customModelUrl, onCustomModel, selectedProvider, onProviderChange }: SidebarProps) {
+function Sidebar({ treeData, indexedCount, expandedPaths, onToggleDir, onFileClick, selectedFile, modelList, selectedModel, onModelChange, modelLoaded, modelLoading, initProgress, onLoadModel, onOpenFolder, attachContext, onAttachContextChange, customModelUrl, onCustomModel, selectedProvider, onProviderChange, onShowBuiltInAI }: SidebarProps) {
   const visibleCount = useMemo(() => {
     if (!treeData) return 0
     let n = 0
@@ -664,37 +937,59 @@ function Sidebar({ treeData, indexedCount, expandedPaths, onToggleDir, onFileCli
 
   return html`
     <div class="flex flex-col h-full">
-      <div class="p-3 border-b border-[#3c3c3c] space-y-2">
-        <button class="w-full px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white text-xs rounded flex items-center justify-center gap-1.5 transition-colors" onClick=${onOpenFolder}>
-          <span>📂</span>
-          <span>${treeData ? 'Change Folder' : 'Open Local Folder'}</span>
+      <div class="px-3 pt-3 pb-2.5 border-b border-line space-y-2">
+        <div class="flex items-center justify-between">
+          <span class="text-[10px] font-semibold uppercase tracking-[0.16em] text-faint">Project</span>
+          ${treeData ? html`<span class="font-mono text-[10px] text-faint">${Math.max(visibleCount, indexedCount)} file${Math.max(visibleCount, indexedCount) === 1 ? '' : 's'}</span>` : ''}
+        </div>
+        ${treeData ? html`<div class="flex items-center gap-1.5 text-muted"><${FolderIcon} open=${true} /><span class="truncate text-[11px]">${rootDirName}</span></div>` : ''}
+        <button class="w-full px-3 py-1.5 bg-raised hover:bg-hover text-ink text-[11.5px] rounded-md border border-line hover:border-line-strong flex items-center justify-center gap-1.5 transition-colors" onClick=${onOpenFolder}>
+          <${FolderPlusIcon} class="w-3.5 h-3.5 text-muted" />
+          <span>${treeData ? 'Change folder' : 'Open folder'}</span>
         </button>
-        ${treeData ? html`<div class="text-xs text-gray-500 flex items-center justify-between"><span class="truncate">${rootDirName}</span><span>${Math.max(visibleCount, indexedCount)} files</span></div>` : ''}
       </div>
-      <div class="flex-1 overflow-y-auto scrollbar-thin">
+      <div class="flex-1 overflow-y-auto py-1.5">
         ${treeData ? html`<${FileTree} entries=${treeData} expandedPaths=${expandedPaths} onToggle=${onToggleDir} onFileClick=${onFileClick} selectedFile=${selectedFile} depth=${0} />`
-        : html`<div class="p-4 text-center text-gray-600 text-xs mt-8"><p class="mb-2">📁</p><p>No folder open</p></div>`}
+        : html`<div class="px-4 py-10 text-center">
+            <${FolderIcon} class="w-6 h-6 mx-auto text-faint" />
+            <p class="mt-2.5 text-[11.5px] text-muted">No folder open</p>
+            <p class="mt-1 text-[10.5px] leading-relaxed text-faint">Files are read locally and never uploaded.</p>
+          </div>`}
       </div>
-      <div class="p-3 border-t border-[#3c3c3c] space-y-2">
-        <select class="w-full bg-[#3c3c3c] text-gray-200 text-xs rounded px-2 py-1.5 border border-[#4c4c4c] outline-none focus:border-blue-500" value=${selectedProvider} onChange=${(e: Event) => onProviderChange((e.target as HTMLSelectElement).value as Provider)} disabled=${modelLoading}>
-          ${window.__gpuAvailable ? html`<option value=${PROVIDERS.WEBLLM}>WebLLM</option>` : ''}
-          ${window.__transformersAvailable ? html`<option value=${PROVIDERS.TRANSFORMERS_JS}>Transformers.js</option>` : ''}
-          ${window.__browserAiAvailable ? html`<option value=${PROVIDERS.BROWSER_AI}>Chrome Built-in AI</option>` : html`<option disabled>${window.__browserAiNote || 'Chrome AI (not available)'}</option>`}
-        </select>
-        <select class="w-full bg-[#3c3c3c] text-gray-200 text-xs rounded px-2 py-1.5 border border-[#4c4c4c] outline-none focus:border-blue-500" value=${selectedModel} onChange=${(e: Event) => onModelChange((e.target as HTMLSelectElement).value)} disabled=${modelLoading}>
-          ${modelList.filter(m => m.provider === selectedProvider).map(m => html`<option value=${m.id}>${m.label || m.id}${m.vram ? ' ('+m.vram+'MB)' : ''}</option>`)}
-        </select>
-        <input type="text" class="w-full bg-[#3c3c3c] text-gray-200 text-xs rounded px-2 py-1.5 border border-[#4c4c4c] outline-none focus:border-blue-500 placeholder-gray-500" placeholder="Custom HF model URL..." value=${customModelUrl} onInput=${(e: Event) => onCustomModel((e.target as HTMLInputElement).value)} />
+      <div class="p-3 border-t border-line space-y-2.5">
+        <div class="text-[10px] font-semibold uppercase tracking-[0.16em] text-faint">Model</div>
+        <label class="block space-y-1">
+          <span class="text-[10px] text-faint">Provider</span>
+          <select class="w-full bg-raised text-ink text-[11.5px] rounded-md px-2.5 py-1.5 border border-line outline-none focus:border-accent/70 disabled:opacity-50" value=${selectedProvider} onChange=${(e: Event) => onProviderChange((e.target as HTMLSelectElement).value as Provider)} disabled=${modelLoading}>
+            ${window.__gpuAvailable ? html`<option value=${PROVIDERS.WEBLLM}>WebLLM</option>` : ''}
+            ${window.__transformersAvailable ? html`<option value=${PROVIDERS.TRANSFORMERS_JS}>Transformers.js</option>` : ''}
+            ${window.__browserAiAvailable ? html`<option value=${PROVIDERS.BROWSER_AI}>Chrome Built-in AI</option>` : html`<option disabled>${window.__browserAiNote || 'Chrome AI (not available)'}</option>`}
+          </select>
+        </label>
+        <button class="w-full flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-md border border-line bg-raised hover:bg-hover text-[10.5px] text-muted hover:text-ink transition-colors" onClick=${onShowBuiltInAI}>
+          <span class="flex items-center gap-1.5"><${SparkIcon} />Built-in AI APIs</span>
+          <span class="text-faint">›</span>
+        </button>
+        <label class="block space-y-1">
+          <span class="text-[10px] text-faint">Model</span>
+          <select class="w-full bg-raised text-ink text-[11.5px] rounded-md px-2.5 py-1.5 border border-line outline-none focus:border-accent/70 disabled:opacity-50" value=${selectedModel} onChange=${(e: Event) => onModelChange((e.target as HTMLSelectElement).value)} disabled=${modelLoading}>
+            ${modelList.filter(m => m.provider === selectedProvider).map(m => html`<option value=${m.id}>${m.label || m.id}${m.vram ? ' · '+m.vram+'MB' : ''}</option>`)}
+          </select>
+        </label>
+        <input type="text" class="w-full bg-raised text-ink text-[11.5px] rounded-md px-2.5 py-1.5 border border-line outline-none focus:border-accent/70 placeholder:text-faint" placeholder="Custom model ID or URL" value=${customModelUrl} onInput=${(e: Event) => onCustomModel((e.target as HTMLInputElement).value)} />
         ${initProgress ? html`
-          <div class="space-y-1">
-            <div class="flex justify-between text-xs text-gray-400"><span class="truncate">${initProgress.text}</span><span>${Math.round(initProgress.progress * 100)}%</span></div>
-            <div class="h-1.5 bg-[#3c3c3c] rounded-full overflow-hidden"><div class="h-full bg-blue-500 rounded-full transition-all duration-300" style=${{ width: `${initProgress.progress * 100}%` }}></div></div>
+          <div class="space-y-1.5">
+            <div class="flex justify-between gap-2 text-[10.5px] text-muted"><span class="line-clamp-3 leading-snug">${initProgress.text}</span><span class="font-mono shrink-0">${Math.round(initProgress.progress * 100)}%</span></div>
+            <div class="h-1 bg-raised rounded-full overflow-hidden"><div class="h-full bg-accent rounded-full transition-all duration-300" style=${{ width: `${initProgress.progress * 100}%` }}></div></div>
           </div>
         ` : ''}
-        <button class="w-full px-3 py-1.5 text-xs rounded transition-colors ${modelLoaded ? 'bg-green-700 hover:bg-green-600 text-white' : modelLoading ? 'bg-yellow-700 text-yellow-200 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-700 text-white'}" onClick=${onLoadModel} disabled=${modelLoading}>
-          ${modelLoaded ? '✓ Model Ready' : modelLoading ? 'Loading...' : 'Load Model'}
+        <button class="w-full px-3 py-1.5 text-[11.5px] rounded-md transition-colors flex items-center justify-center gap-1.5 ${modelLoaded ? 'border border-ok/40 bg-ok/10 text-ok' : modelLoading ? 'bg-raised text-muted border border-line cursor-not-allowed' : 'bg-accent hover:bg-accent-strong text-accent-ink font-medium'}" onClick=${onLoadModel} disabled=${modelLoading}>
+          ${modelLoaded ? html`<${CheckIcon} /><span>Model ready</span>` : modelLoading ? 'Loading…' : 'Load model'}
         </button>
-        <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer"><input type="checkbox" checked=${attachContext} onChange=${(e: Event) => onAttachContextChange((e.target as HTMLInputElement).checked)} class="accent-blue-500" /><span>Attach Project Context</span></label>
+        <label class="flex items-start gap-2 text-[11px] text-muted cursor-pointer leading-snug">
+          <input type="checkbox" checked=${attachContext} onChange=${(e: Event) => onAttachContextChange((e.target as HTMLInputElement).checked)} class="accent-accent mt-0.5" />
+          <span>Attach project context</span>
+        </label>
       </div>
     </div>
   `
@@ -714,21 +1009,23 @@ function FileTree({ entries, expandedPaths, onToggle, onFileClick, selectedFile,
     if (e.type === 'dir') {
       const open = expandedPaths.has(e.path)
       return html`<div key=${e.path}>
-        <div class="flex items-center cursor-pointer px-2 py-0.5 text-gray-300 hover:bg-[#2a2a2a] file-tree-item" style=${{ paddingLeft: `${depth*14+8}px` }} onClick=${() => onToggle(e)}>
-          <span class="text-xs w-4 shrink-0">${open ? '▾' : '▸'}</span>
-          <span class="text-xs mr-1 shrink-0">${open ? '📂' : '📁'}</span>
-          <span class="text-xs truncate">${e.name}</span>
+        <div class="flex items-center gap-1.5 pr-2 py-[3px] text-[11.5px] text-muted hover:bg-hover hover:text-ink transition-colors select-none file-tree-item" style=${{ paddingLeft: `${depth*12+8}px` }} onClick=${() => onToggle(e)}>
+          <${Chevron} open=${open} class="w-2.5 h-2.5 text-faint" />
+          <${FolderIcon} open=${open} class="w-3.5 h-3.5 shrink-0 text-faint" />
+          <span class="truncate">${e.name}</span>
         </div>
         ${open
           ? e.loaded
             ? (e.children ? html`<${FileTree} entries=${e.children} expandedPaths=${expandedPaths} onToggle=${onToggle} onFileClick=${onFileClick} selectedFile=${selectedFile} depth=${depth+1} />` : '')
-            : html`<div class="text-xs text-gray-600 py-0.5" style=${{ paddingLeft: `${(depth+1)*14+8}px` }}>Loading…</div>`
+            : html`<div class="text-[10.5px] text-faint py-[3px] pl-10">Loading…</div>`
           : ''}
       </div>`
     }
-    return html`<div key=${e.path} class="flex items-center cursor-pointer px-2 py-0.5 ${e.path===selectedFile?'bg-[#37373d] text-white':'text-gray-400 hover:text-gray-200'} file-tree-item" style=${{ paddingLeft: `${depth*14+8}px` }} onClick=${() => onFileClick(e.path)}>
-      <span class="text-xs mr-1 shrink-0">📄</span>
-      <span class="text-xs truncate">${e.name}</span>
+    const selected = e.path === selectedFile
+    return html`<div key=${e.path} class="flex items-center gap-1.5 pr-2 py-[3px] text-[11.5px] cursor-pointer transition-colors select-none file-tree-item ${selected ? 'bg-raised text-ink shadow-[inset_2px_0_0_var(--color-accent)]' : 'text-muted hover:bg-hover hover:text-ink'}" style=${{ paddingLeft: `${depth*12+8}px` }} onClick=${() => onFileClick(e.path)}>
+      <span class="w-2.5 shrink-0"></span>
+      <${FileIcon} class="w-3.5 h-3.5 shrink-0 text-faint" />
+      <span class="truncate">${e.name}</span>
     </div>`
   })}`
 }
@@ -755,24 +1052,25 @@ function MessageBubble({ msg, onApply, appliedBlocks }: MessageBubbleProps) {
     return res
   }, [msg.content])
 
+  const isUser = msg.role === 'user'
   return html`
-    <div class="flex ${msg.role==='user'?'justify-end':'justify-start'}">
-      <div class="max-w-[92%] ${msg.role==='user'?'bg-blue-700 text-white rounded-2xl rounded-br-sm':'bg-[#2d2d2d] text-gray-200 rounded-2xl rounded-bl-sm'} px-3 py-2">
-        ${msg.role==='assistant' ? html`<div class="text-[11px] text-gray-500 mb-1 font-medium">Coder</div>` : ''}
-        <div class="text-xs leading-relaxed whitespace-pre-wrap break-words">
-          ${parts.map((p: any, i: number) => {
+    <div class="flex ${isUser ? 'justify-end' : 'justify-start'}">
+      <div class="${isUser ? 'max-w-[88%] rounded-2xl rounded-br-md bg-raised border border-line px-3 py-2 text-ink' : 'max-w-[94%] w-full'}">
+        ${!isUser ? html`<div class="flex items-center gap-1.5 mb-1.5 text-[10px] font-semibold uppercase tracking-[0.12em] text-faint"><span class="w-1.5 h-1.5 rounded-full bg-accent"></span>Coder</div>` : ''}
+        <div class="text-[12.5px] leading-relaxed whitespace-pre-wrap break-words">
+          ${parts.map((p, i: number) => {
             if (p.t === 'text') return html`<span key=${i}>${p.v}</span>`
             const bi = appliedBlocks.findIndex((b: CodeBlock) => b.path===p.path && b.code===p.code)
             const applied = bi >= 0 && appliedBlocks[bi].applied
-            return html`<div key=${i} class="my-2 bg-[#1e1e1e] rounded overflow-hidden border border-[#3c3c3c]">
-              <div class="flex items-center justify-between px-2 py-1 bg-[#252526] border-b border-[#3c3c3c]">
-                <span class="text-[10px] text-gray-400 truncate">${p.path || p.lang}</span>
-                ${p.path ? html`<button class="text-[10px] px-2 py-0.5 rounded shrink-0 ml-2 transition-colors ${applied?'bg-green-800 text-green-300':'bg-blue-600 hover:bg-blue-500 text-white'}" onClick=${() => !applied && onApply(p.path!, p.code!)} disabled=${applied}>${applied?'✓ Applied':'Apply'}</button>` : ''}
+            return html`<div key=${i} class="my-2 rounded-lg overflow-hidden border border-line bg-canvas">
+              <div class="flex items-center justify-between gap-2 px-2.5 py-1.5 bg-panel border-b border-line">
+                <span class="font-mono text-[10px] text-muted truncate">${p.path || p.lang}</span>
+                ${p.path ? html`<button class="text-[10px] px-2 py-0.5 rounded shrink-0 transition-colors ${applied ? 'text-ok border border-ok/30' : 'bg-accent hover:bg-accent-strong text-accent-ink font-medium'}" onClick=${() => !applied && onApply(p.path!, p.code!)} disabled=${applied}>${applied ? 'Applied' : 'Apply'}</button>` : ''}
               </div>
-              <pre class="text-[11px] p-2 overflow-x-auto scrollbar-thin"><code>${p.code}</code></pre>
+              <pre class="text-[11.5px] leading-relaxed p-3 overflow-x-auto font-mono text-ink"><code>${p.code}</code></pre>
             </div>`
           })}
-          ${msg.isStreaming ? html`<span class="inline-block w-1.5 h-4 bg-blue-400 animate-pulse ml-0.5 align-text-bottom"></span>` : ''}
+          ${msg.isStreaming ? html`<span class="inline-block w-1.5 h-4 bg-accent animate-pulse ml-0.5 align-text-bottom"></span>` : ''}
         </div>
       </div>
     </div>
@@ -788,14 +1086,30 @@ interface ChatPanelProps {
   onStop: () => void
   onApply: (path: string, code: string) => void
   onClear: () => void
+  onExport: () => void
   modelLoaded: boolean
+  draft: string
+  onDraftConsumed: () => void
 }
 
-function ChatPanel({ messages, streamingContent, codeBlocks, isGenerating, onSend, onStop, onApply, onClear, modelLoaded }: ChatPanelProps) {
+function ChatPanel({ messages, streamingContent, codeBlocks, isGenerating, onSend, onStop, onApply, onClear, onExport, modelLoaded, draft, onDraftConsumed }: ChatPanelProps) {
   const endRef = useRef<HTMLDivElement | null>(null)
   const [input, setInput] = useState('')
+  const [confirmClear, setConfirmClear] = useState(false)
 
   useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages, streamingContent, codeBlocks])
+
+  useEffect(() => {
+    if (!draft) return
+    setInput(draft)
+    onDraftConsumed()
+  }, [draft, onDraftConsumed])
+
+  useEffect(() => {
+    if (!confirmClear) return
+    const timer = setTimeout(() => setConfirmClear(false), 3000)
+    return () => clearTimeout(timer)
+  }, [confirmClear])
 
   const send = useCallback(() => {
     const t = input.trim()
@@ -818,38 +1132,639 @@ function ChatPanel({ messages, streamingContent, codeBlocks, isGenerating, onSen
 
   return html`
     <div class="flex flex-col h-full">
-      <div class="h-9 border-b border-[#3c3c3c] flex items-center px-3 shrink-0">
-        <span class="text-xs font-medium text-gray-300">AI Chat</span>
-        <button class="ml-auto text-xs text-gray-500 hover:text-gray-300" onClick=${onClear}>Clear</button>
+      <div class="h-10 border-b border-line flex items-center gap-3 px-3 shrink-0">
+        <span class="text-[10px] font-semibold uppercase tracking-[0.16em] text-faint">Chat</span>
+        <div class="ml-auto flex items-center gap-2.5 text-[10.5px]">
+          <button class="text-faint hover:text-ink transition-colors disabled:opacity-40 disabled:hover:text-faint" onClick=${onExport} disabled=${messages.length === 0}>Export</button>
+          <button
+            class="transition-colors ${confirmClear ? 'text-accent font-medium' : 'text-faint hover:text-ink'}"
+            onClick=${() => { if (confirmClear) { onClear(); setConfirmClear(false) } else setConfirmClear(true) }}
+          >${confirmClear ? 'Confirm clear' : 'Clear'}</button>
+        </div>
       </div>
-      <div class="flex-1 overflow-y-auto scrollbar-thin p-3 space-y-3">
+      <div class="flex-1 overflow-y-auto p-3 space-y-4">
         ${all.length===0 ? html`
-          <div class="text-center text-gray-600 text-xs mt-8">
-            <p class="mb-1">🤖</p>
-            <p>Ask the AI to help with your code</p>
-            ${!modelLoaded ? html`<p class="mt-2 text-yellow-600">Load a model first</p>` : ''}
+          <div class="h-full flex flex-col items-center justify-center text-center px-4">
+            <${Logo} class="w-10 h-10 mb-4" />
+            <p class="text-[12.5px] font-medium text-ink">${modelLoaded ? 'Ask about your code' : 'No model loaded'}</p>
+            <p class="mt-1.5 text-[11px] leading-relaxed text-muted max-w-[240px]">${modelLoaded
+              ? 'The assistant reads and edits your project only when context is attached.'
+              : 'Load a model from the sidebar to start. Everything runs on this device.'}</p>
+            ${modelLoaded ? html`
+              <div class="mt-4 flex flex-wrap justify-center gap-1.5">
+                ${['Explain the open file', 'Find bugs in this project', 'Write a test'].map(prompt => html`
+                  <button key=${prompt} class="px-2.5 py-1 rounded-full border border-line bg-raised text-[10.5px] text-muted hover:text-ink hover:border-line-strong transition-colors" onClick=${() => onSend(prompt)}>${prompt}</button>
+                `)}
+              </div>` : ''}
           </div>
         ` : all.map((m: Message, i: number) => html`<${MessageBubble} key=${i} msg=${m} onApply=${onApply} appliedBlocks=${codeBlocks} />`)}
-        ${isGenerating && !streamingContent ? html`<div class="flex items-center gap-1 text-gray-500 text-xs px-3 py-2"><span class="dot-pulse">●</span><span class="dot-pulse">●</span><span class="dot-pulse">●</span></div>` : ''}
+        ${isGenerating && !streamingContent ? html`<div class="flex items-center gap-1 text-accent px-1 py-1"><span class="dot-pulse">●</span><span class="dot-pulse">●</span><span class="dot-pulse">●</span></div>` : ''}
         <div ref=${endRef} />
       </div>
-      <div class="p-3 border-t border-[#3c3c3c] space-y-2">
+      <div class="p-3 border-t border-line space-y-2">
         ${codeBlocks.filter(b => !b.applied).length > 0 ? html`
-          <div class="space-y-1 max-h-20 overflow-y-auto scrollbar-thin">
+          <div class="space-y-1 max-h-24 overflow-y-auto">
             ${codeBlocks.filter(b => !b.applied).map((b, i) => html`
-              <div key=${i} class="flex items-center justify-between bg-[#2d2d2d] rounded px-2 py-1 border border-[#3c3c3c]">
-                <span class="text-[10px] text-gray-400 truncate">${b.path || b.lang}</span>
-                <button class="text-[10px] px-2 py-0.5 bg-blue-600 hover:bg-blue-500 text-white rounded shrink-0 ml-2" onClick=${() => onApply(b.path, b.code)}>Apply</button>
+              <div key=${i} class="flex items-center justify-between gap-2 bg-raised rounded-md px-2.5 py-1.5 border border-line">
+                <span class="font-mono text-[10px] text-muted truncate">${b.path || b.lang}</span>
+                <button class="text-[10px] px-2 py-0.5 bg-accent hover:bg-accent-strong text-accent-ink font-medium rounded shrink-0" onClick=${() => onApply(b.path, b.code)}>Apply</button>
               </div>
             `)}
           </div>
         ` : ''}
-        <div class="flex gap-2">
-          <textarea class="flex-1 bg-[#3c3c3c] text-gray-200 text-xs rounded px-2.5 py-1.5 border border-[#4c4c4c] outline-none focus:border-blue-500 resize-none placeholder-gray-500" rows=${2} placeholder=${modelLoaded?"Ask about your code...":"Load a model first..."} value=${input} onInput=${(e: Event)=>setInput((e.target as HTMLTextAreaElement).value)} onKeyDown=${kd} disabled=${!modelLoaded}></textarea>
+        <div class="flex gap-2 items-end">
+          <textarea class="flex-1 bg-raised text-ink text-[12px] leading-relaxed rounded-lg px-3 py-2 border border-line outline-none focus:border-accent/70 resize-none placeholder:text-faint disabled:opacity-60" rows=${2} placeholder=${modelLoaded?"Ask about your code…":"Load a model first…"} value=${input} onInput=${(e: Event)=>setInput((e.target as HTMLTextAreaElement).value)} onKeyDown=${kd} disabled=${!modelLoaded}></textarea>
           <div class="flex flex-col gap-1">
-            <button class="px-3 py-1.5 text-xs rounded ${modelLoaded&&!isGenerating?'bg-blue-600 hover:bg-blue-700 text-white':'bg-[#3c3c3c] text-gray-500 cursor-not-allowed'}" onClick=${send} disabled=${!modelLoaded||isGenerating}>Send</button>
-            ${isGenerating ? html`<button class="px-3 py-1.5 text-xs rounded bg-red-700 hover:bg-red-600 text-white" onClick=${onStop}>Stop</button>` : ''}
+            <button class="px-3 py-1.5 text-[11.5px] rounded-lg transition-colors ${modelLoaded&&!isGenerating?'bg-accent hover:bg-accent-strong text-accent-ink font-medium':'bg-raised text-faint border border-line cursor-not-allowed'}" onClick=${send} disabled=${!modelLoaded||isGenerating}>Send</button>
+            ${isGenerating ? html`<button class="px-3 py-1.5 text-[11.5px] rounded-lg border border-danger/40 text-danger hover:bg-danger/10 transition-colors" onClick=${onStop}>Stop</button>` : ''}
           </div>
+        </div>
+      </div>
+    </div>
+  `
+}
+
+const IS_MAC = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent)
+
+function ResizeHandle({ width, min, max, invert, onWidth }: { width: number; min: number; max: number; invert?: boolean; onWidth: (width: number) => void }) {
+  const start = useRef<{ x: number; width: number } | null>(null)
+
+  useEffect(() => () => { document.body.style.cursor = '' }, [])
+
+  const onPointerDown = (e: PointerEvent) => {
+    e.preventDefault()
+    start.current = { x: e.clientX, width }
+    const onMove = (ev: PointerEvent) => {
+      const origin = start.current
+      if (!origin) return
+      const delta = ev.clientX - origin.x
+      onWidth(Math.min(max, Math.max(min, origin.width + (invert ? -delta : delta))))
+    }
+    const onUp = () => {
+      start.current = null
+      window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', onUp)
+      document.body.style.cursor = ''
+    }
+    document.body.style.cursor = 'col-resize'
+    window.addEventListener('pointermove', onMove)
+    window.addEventListener('pointerup', onUp)
+  }
+
+  return html`<div class="hidden md:block w-1 shrink-0 cursor-col-resize bg-line hover:bg-accent/60 active:bg-accent transition-colors z-20" role="separator" aria-orientation="vertical" onPointerDown=${onPointerDown}></div>`
+}
+
+function QuickOpen({ files, onSelect, onClose }: { files: string[]; onSelect: (path: string) => void; onClose: () => void }) {
+  const [query, setQuery] = useState('')
+  const [active, setActive] = useState(0)
+  const inputRef = useRef<HTMLInputElement | null>(null)
+
+  useEffect(() => { inputRef.current?.focus() }, [])
+
+  const results = useMemo(() => {
+    const q = query.trim().toLowerCase()
+    if (!q) return files.slice(0, 100)
+    const scored: Array<{ path: string; index: number }> = []
+    for (const path of files) {
+      const index = path.toLowerCase().indexOf(q)
+      if (index >= 0) scored.push({ path, index })
+    }
+    scored.sort((a, b) => a.index - b.index || a.path.length - b.path.length)
+    return scored.slice(0, 100).map(entry => entry.path)
+  }, [files, query])
+
+  useEffect(() => { setActive(0) }, [query])
+  useEffect(() => {
+    if (active > results.length - 1) setActive(Math.max(0, results.length - 1))
+  }, [results, active])
+
+  const onKeyDown = (e: KeyboardEvent) => {
+    if (e.key === 'Escape') { e.preventDefault(); onClose() }
+    else if (e.key === 'ArrowDown') { e.preventDefault(); setActive(a => Math.min(a + 1, Math.max(0, results.length - 1))) }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); setActive(a => Math.max(a - 1, 0)) }
+    else if (e.key === 'Enter') {
+      e.preventDefault()
+      const pick = results[active]
+      if (pick) onSelect(pick)
+    }
+  }
+
+  return html`
+    <div class="fixed inset-0 z-50 flex items-start justify-center pt-[12vh] px-4">
+      <div class="absolute inset-0 bg-black/60 backdrop-blur-[2px]" onClick=${onClose}></div>
+      <div role="dialog" aria-modal="true" aria-label="Open file" class="relative w-full max-w-lg bg-panel border border-line rounded-xl shadow-2xl overflow-hidden">
+        <div class="flex items-center gap-2 px-3 py-2.5 border-b border-line">
+          <${SearchIcon} class="w-3.5 h-3.5 text-faint" />
+          <input
+            ref=${inputRef}
+            class="flex-1 bg-transparent text-ink text-[12px] outline-none placeholder:text-faint"
+            placeholder="Search files by path…"
+            value=${query}
+            onInput=${(e: Event) => setQuery((e.target as HTMLInputElement).value)}
+            onKeyDown=${onKeyDown}
+          />
+          <span class="font-mono text-[9.5px] text-faint">${files.length} files</span>
+        </div>
+        <div class="max-h-[50vh] overflow-y-auto py-1">
+          ${results.length === 0
+            ? html`<p class="px-3 py-6 text-center text-[11px] text-muted">${files.length === 0 ? 'No files indexed yet. Open a folder first.' : 'No matching files.'}</p>`
+            : results.map((path, index) => {
+                const name = path.split('/').pop() || path
+                const dir = path.slice(0, path.length - name.length).replace(/\/$/, '')
+                return html`<button
+                  key=${path}
+                  class="w-full flex items-center gap-2 px-3 py-1.5 text-left transition-colors ${index === active ? 'bg-raised text-ink' : 'text-muted hover:bg-raised hover:text-ink'}"
+                  onMouseEnter=${() => setActive(index)}
+                  onClick=${() => onSelect(path)}
+                >
+                  <${FileIcon} class="w-3.5 h-3.5 shrink-0 text-faint" />
+                  <span class="text-[11.5px] truncate">${name}</span>
+                  ${dir ? html`<span class="ml-auto font-mono text-[9.5px] text-faint truncate max-w-[45%]">${dir}</span>` : ''}
+                </button>`
+              })}
+        </div>
+        <div class="px-3 py-2 border-t border-line text-[9.5px] text-faint flex items-center gap-3">
+          <span><span class="font-mono">↑↓</span> navigate</span>
+          <span><span class="font-mono">↵</span> open</span>
+          <span><span class="font-mono">esc</span> close</span>
+        </div>
+      </div>
+    </div>
+  `
+}
+
+class ErrorBoundary extends Component<{ children?: unknown }, { error: Error | null }> {
+  state: { error: Error | null } = { error: null }
+
+  static getDerivedStateFromError(error: Error) {
+    return { error }
+  }
+
+  componentDidCatch(error: Error) {
+    console.error('UI error:', error)
+    addNotification(`UI error: ${error.message}`, 'error')
+  }
+
+  render() {
+    if (this.state.error) {
+      return html`
+        <div class="h-screen flex items-center justify-center bg-canvas p-6">
+          <div class="text-center max-w-sm">
+            <${Logo} class="w-10 h-10 mx-auto mb-4" />
+            <h1 class="text-ink text-[14px] font-semibold">Something went wrong</h1>
+            <p class="mt-2 text-[11px] text-muted leading-relaxed">${this.state.error.message}</p>
+            <button class="mt-4 px-3 py-1.5 rounded-md bg-accent hover:bg-accent-strong text-accent-ink text-[11.5px] font-medium transition-colors" onClick=${() => location.reload()}>Reload</button>
+          </div>
+        </div>
+      `
+    }
+    return this.props.children
+  }
+}
+
+const BUILT_IN_STATUS: Record<BuiltInApiStatus, { label: string; dot: string; text: string }> = {
+  available: { label: 'Available', dot: 'bg-ok', text: 'text-ok' },
+  downloadable: { label: 'Download needed', dot: 'bg-accent', text: 'text-accent' },
+  downloading: { label: 'Downloading', dot: 'bg-accent animate-pulse', text: 'text-accent' },
+  unavailable: { label: 'Unavailable', dot: 'bg-danger', text: 'text-danger' },
+  unsupported: { label: 'Not exposed', dot: 'bg-faint', text: 'text-faint' },
+}
+
+function BuiltInAIPanel({ onClose }: { onClose: () => void }) {
+  const [apis, setApis] = useState<BuiltInApiInfo[] | null>(null)
+
+  useEffect(() => {
+    let alive = true
+    getBuiltInAICapabilities()
+      .then(list => { if (alive) setApis(list) })
+      .catch(() => { if (alive) setApis([]) })
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    window.addEventListener('keydown', onKey)
+    return () => {
+      alive = false
+      window.removeEventListener('keydown', onKey)
+    }
+  }, [onClose])
+
+  const ready = apis?.filter(api => api.status === 'available').length ?? 0
+
+  return html`
+    <div class="fixed inset-0 z-50 flex items-center justify-center p-4">
+      <div class="absolute inset-0 bg-black/60 backdrop-blur-[2px]" onClick=${onClose}></div>
+      <div role="dialog" aria-modal="true" aria-labelledby="built-in-ai-title" class="relative w-full max-w-lg bg-panel border border-line rounded-xl shadow-2xl overflow-hidden">
+        <div class="flex items-center gap-2.5 px-4 py-3 border-b border-line">
+          <${Logo} class="w-5 h-5" />
+          <div class="min-w-0">
+            <h2 id="built-in-ai-title" class="text-[12.5px] font-semibold text-ink leading-tight">Built-in AI</h2>
+            <p class="text-[10px] text-faint">On-device APIs exposed by this browser</p>
+          </div>
+          <span class="ml-auto font-mono text-[10px] text-muted">${apis ? `${ready}/${apis.length} ready` : ''}</span>
+          <button class="p-1 rounded text-muted hover:text-ink hover:bg-raised transition-colors" aria-label="Close" onClick=${onClose}>✕</button>
+        </div>
+        <div class="p-2 max-h-[65vh] overflow-y-auto">
+          ${apis
+            ? apis.map(api => {
+                const s = BUILT_IN_STATUS[api.status]
+                return html`<div key=${api.id} class="flex items-start gap-2.5 rounded-lg px-2.5 py-2 hover:bg-raised transition-colors">
+                  <span class="mt-[5px] w-1.5 h-1.5 rounded-full ${s.dot} shrink-0"></span>
+                  <div class="min-w-0">
+                    <div class="flex items-baseline gap-2">
+                      <span class="text-[11.5px] font-medium text-ink">${api.label}</span>
+                      <span class="text-[9px] font-semibold uppercase tracking-[0.12em] ${s.text}">${s.label}</span>
+                    </div>
+                    <p class="text-[10.5px] leading-snug text-muted mt-0.5">${api.description}</p>
+                    ${api.note ? html`<p class="text-[9.5px] text-faint mt-0.5">${api.note}</p>` : ''}
+                  </div>
+                </div>`
+              })
+            : html`<div class="px-3 py-8 text-center text-[11px] text-muted">Probing built-in APIs…</div>`}
+        </div>
+        <p class="px-4 py-3 border-t border-line text-[9.5px] leading-relaxed text-faint">
+          Only official Google Chrome on desktop exposes these APIs, in a secure context. Open-source Chromium and other browsers do not ship the on-device model — use WebLLM or Transformers.js there.
+        </p>
+      </div>
+    </div>
+  `
+}
+
+const TRANSLATE_LANGUAGES: Array<[string, string]> = [
+  ['en', 'English'], ['es', 'Spanish'], ['fr', 'French'], ['de', 'German'],
+  ['it', 'Italian'], ['pt', 'Portuguese'], ['nl', 'Dutch'], ['pl', 'Polish'],
+  ['ru', 'Russian'], ['uk', 'Ukrainian'], ['tr', 'Turkish'], ['ar', 'Arabic'],
+  ['hi', 'Hindi'], ['ja', 'Japanese'], ['ko', 'Korean'], ['zh', 'Chinese'],
+  ['vi', 'Vietnamese'], ['th', 'Thai'], ['id', 'Indonesian'],
+]
+
+const languageLabel = (code: string) => TRANSLATE_LANGUAGES.find(([value]) => value === code)?.[1] ?? code
+
+interface SummarizerInstance {
+  summarizeStreaming(text: string, options?: { context?: string }): AsyncIterable<string>
+  destroy?: () => void
+}
+interface SummarizerConstructor {
+  availability(): Promise<string>
+  create(options?: Record<string, unknown>): Promise<SummarizerInstance>
+}
+interface LanguageDetection {
+  detectedLanguage: string
+  confidence: number
+}
+interface LanguageDetectorInstance {
+  detect(text: string): Promise<LanguageDetection[]>
+  destroy?: () => void
+}
+interface LanguageDetectorConstructor {
+  create(options?: Record<string, unknown>): Promise<LanguageDetectorInstance>
+}
+interface TranslatorInstance {
+  translateStreaming(text: string): AsyncIterable<string>
+  destroy?: () => void
+}
+interface TranslatorConstructor {
+  availability(options: { sourceLanguage: string; targetLanguage: string }): Promise<string>
+  create(options: Record<string, unknown>): Promise<TranslatorInstance>
+}
+interface ProofreadResult {
+  correctedInput: string
+  corrections: Array<{ startIndex: number; endIndex: number; correction: string }>
+}
+interface ProofreaderInstance {
+  proofread(text: string): Promise<ProofreadResult>
+  destroy?: () => void
+}
+interface ProofreaderConstructor {
+  availability(): Promise<string>
+  create(options?: Record<string, unknown>): Promise<ProofreaderInstance>
+}
+interface RewriterInstance {
+  rewriteStreaming(text: string, options?: { context?: string }): AsyncIterable<string>
+  destroy?: () => void
+}
+interface RewriterConstructor {
+  availability(): Promise<string>
+  create(options?: Record<string, unknown>): Promise<RewriterInstance>
+}
+
+/** Reads an untyped built-in AI global by name; the names are from a fixed list. */
+function builtInCtor<T>(name: string): T | undefined {
+  const globals = globalThis as unknown as Record<string, unknown>
+  const value = globals[name]
+  if (typeof value !== 'function') return undefined
+  return value as T
+}
+
+function BuiltInTaskDialog({ request, onClose, onReplace }: { request: BuiltInActionRequest; onClose: () => void; onReplace: (text: string) => void }) {
+  const [output, setOutput] = useState('')
+  const [error, setError] = useState('')
+  const [info, setInfo] = useState('')
+  const [preparing, setPreparing] = useState(true)
+  const [copied, setCopied] = useState(false)
+  const [detected, setDetected] = useState('')
+  const [source, setSource] = useState('auto')
+  const [target, setTarget] = useState('en')
+  const [tone, setTone] = useState('more-formal')
+  const [length, setLength] = useState('shorter')
+  const [corrections, setCorrections] = useState(0)
+  const detectorAvailable = hasBuiltInApi('LanguageDetector')
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+
+  useEffect(() => {
+    if (request.kind !== 'summarize' && request.kind !== 'summarize-file') return
+    let stale = false
+    ;(async () => {
+      setPreparing(true); setError(''); setInfo(''); setOutput('')
+      const SummarizerCtor = builtInCtor<SummarizerConstructor>('Summarizer')
+      if (!SummarizerCtor) {
+        setError('The Summarizer API is not exposed in this browser.')
+        setPreparing(false)
+        return
+      }
+      try {
+        const availability = await SummarizerCtor.availability()
+        if (availability === 'unavailable') {
+          setError('The on-device summarizer is not available. Check Built-in AI APIs for its status.')
+          setPreparing(false)
+          return
+        }
+        if (availability !== 'available') setInfo('The summary model is downloading. This can take a few minutes.')
+        const summarizer = await SummarizerCtor.create({
+          type: 'key-points',
+          format: 'markdown',
+          length: 'short',
+          sharedContext: 'Text selected in a source file or documentation from a developer project.',
+        })
+        if (stale) { summarizer.destroy?.(); return }
+        setPreparing(false)
+        let text = ''
+        for await (const chunk of summarizer.summarizeStreaming(request.text)) {
+          if (stale) break
+          text += chunk
+          setOutput(text)
+        }
+        summarizer.destroy?.()
+      } catch (err) {
+        if (!stale) {
+          setError((err as Error).message || 'Summarization failed.')
+          setPreparing(false)
+        }
+      }
+    })()
+    return () => { stale = true }
+  }, [request])
+
+  useEffect(() => {
+    if (request.kind !== 'translate') return
+    let stale = false
+    ;(async () => {
+      if (!detectorAvailable) {
+        setSource('en')
+        setTarget('es')
+        return
+      }
+      const DetectorCtor = builtInCtor<LanguageDetectorConstructor>('LanguageDetector')
+      if (!DetectorCtor) return
+      try {
+        const detector = await DetectorCtor.create()
+        const results = await detector.detect(request.text)
+        detector.destroy?.()
+        if (stale) return
+        const best = [...results].sort((a, b) => b.confidence - a.confidence)[0]
+        if (best?.detectedLanguage) {
+          setDetected(best.detectedLanguage)
+          setTarget(best.detectedLanguage === 'en' ? 'es' : 'en')
+        } else {
+          setSource('en')
+          setTarget('es')
+        }
+      } catch {
+        if (!stale) { setSource('en'); setTarget('es') }
+      }
+    })()
+    return () => { stale = true }
+  }, [request, detectorAvailable])
+
+  useEffect(() => {
+    if (request.kind !== 'translate') return
+    const sourceLanguage = source === 'auto' ? detected : source
+    if (!sourceLanguage || !target) return
+    if (sourceLanguage === target) {
+      setOutput('')
+      setError('')
+      setInfo('Source and target languages are the same.')
+      setPreparing(false)
+      return
+    }
+    let stale = false
+    ;(async () => {
+      setPreparing(true); setError(''); setInfo(''); setOutput('')
+      const TranslatorCtor = builtInCtor<TranslatorConstructor>('Translator')
+      if (!TranslatorCtor) {
+        setError('The Translator API is not exposed in this browser.')
+        setPreparing(false)
+        return
+      }
+      try {
+        const availability = await TranslatorCtor.availability({ sourceLanguage, targetLanguage: target })
+        if (availability === 'unavailable') {
+          setError(`This browser cannot translate ${languageLabel(sourceLanguage)} → ${languageLabel(target)} yet.`)
+          setPreparing(false)
+          return
+        }
+        if (availability !== 'available') setInfo('The language pack is downloading. This can take a minute.')
+        const translator = await TranslatorCtor.create({ sourceLanguage, targetLanguage: target })
+        if (stale) { translator.destroy?.(); return }
+        setPreparing(false)
+        let text = ''
+        for await (const chunk of translator.translateStreaming(request.text)) {
+          if (stale) break
+          text += chunk
+          setOutput(text)
+        }
+        translator.destroy?.()
+      } catch (err) {
+        if (!stale) {
+          setError((err as Error).message || 'Translation failed.')
+          setPreparing(false)
+        }
+      }
+    })()
+    return () => { stale = true }
+  }, [request, source, target, detected])
+
+  useEffect(() => {
+    if (request.kind !== 'proofread') return
+    let stale = false
+    ;(async () => {
+      setPreparing(true); setError(''); setInfo(''); setOutput(''); setCorrections(0)
+      const ProofreaderCtor = builtInCtor<ProofreaderConstructor>('Proofreader')
+      if (!ProofreaderCtor) {
+        setError('The Proofreader API is not exposed in this browser.')
+        setPreparing(false)
+        return
+      }
+      try {
+        const availability = await ProofreaderCtor.availability()
+        if (availability === 'unavailable') {
+          setError('The on-device proofreader is not available. Check Built-in AI APIs for its status.')
+          setPreparing(false)
+          return
+        }
+        if (availability !== 'available') setInfo('The proofreading model is downloading. This can take a few minutes.')
+        const proofreader = await ProofreaderCtor.create()
+        if (stale) { proofreader.destroy?.(); return }
+        const result = await proofreader.proofread(request.text)
+        proofreader.destroy?.()
+        if (stale) return
+        setCorrections(result.corrections?.length ?? 0)
+        setOutput(result.correctedInput || '')
+        setPreparing(false)
+      } catch (err) {
+        if (!stale) {
+          setError((err as Error).message || 'Proofreading failed.')
+          setPreparing(false)
+        }
+      }
+    })()
+    return () => { stale = true }
+  }, [request])
+
+  useEffect(() => {
+    if (request.kind !== 'rewrite') return
+    let stale = false
+    ;(async () => {
+      setPreparing(true); setError(''); setInfo(''); setOutput('')
+      const RewriterCtor = builtInCtor<RewriterConstructor>('Rewriter')
+      if (!RewriterCtor) {
+        setError('The Rewriter API is not exposed in this browser.')
+        setPreparing(false)
+        return
+      }
+      try {
+        const availability = await RewriterCtor.availability()
+        if (availability === 'unavailable') {
+          setError('The on-device rewriter is not available. Check Built-in AI APIs for its status.')
+          setPreparing(false)
+          return
+        }
+        if (availability !== 'available') setInfo('The rewriting model is downloading. This can take a few minutes.')
+        const rewriter = await RewriterCtor.create({
+          tone,
+          length,
+          format: 'as-is',
+          sharedContext: 'Comments, documentation, and technical text from a developer project.',
+        })
+        if (stale) { rewriter.destroy?.(); return }
+        setPreparing(false)
+        let text = ''
+        for await (const chunk of rewriter.rewriteStreaming(request.text)) {
+          if (stale) break
+          text += chunk
+          setOutput(text)
+        }
+        rewriter.destroy?.()
+      } catch (err) {
+        if (!stale) {
+          setError((err as Error).message || 'Rewrite failed.')
+          setPreparing(false)
+        }
+      }
+    })()
+    return () => { stale = true }
+  }, [request, tone, length])
+
+  const copy = async () => {
+    if (!output) return
+    try {
+      await navigator.clipboard.writeText(output)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1500)
+    } catch {}
+  }
+
+  const title = request.kind === 'summarize'
+    ? 'Summarize selection'
+    : request.kind === 'summarize-file'
+      ? `Summarize ${request.path?.split('/').pop() || 'file'}`
+      : request.kind === 'translate'
+        ? 'Translate selection'
+        : request.kind === 'proofread'
+          ? 'Proofread selection'
+          : 'Rewrite selection'
+
+  const apiLabel = request.kind === 'summarize' || request.kind === 'summarize-file'
+    ? 'Chrome Summarizer · on-device'
+    : request.kind === 'translate'
+      ? `Chrome Translator${detectorAvailable ? ' + Language Detector' : ''} · on-device`
+      : request.kind === 'proofread'
+        ? 'Chrome Proofreader · on-device'
+        : 'Chrome Rewriter · on-device'
+
+  return html`
+    <div class="fixed inset-0 z-50 flex items-center justify-center p-4">
+      <div class="absolute inset-0 bg-black/60 backdrop-blur-[2px]" onClick=${onClose}></div>
+      <div role="dialog" aria-modal="true" aria-labelledby="built-in-task-title" class="relative w-full max-w-xl bg-panel border border-line rounded-xl shadow-2xl overflow-hidden flex flex-col max-h-[80vh]">
+        <div class="flex items-center gap-2.5 px-4 py-3 border-b border-line shrink-0">
+          <${SparkIcon} class="w-4 h-4 text-accent" />
+          <div class="min-w-0">
+            <h2 id="built-in-task-title" class="text-[12.5px] font-semibold text-ink leading-tight">${title}</h2>
+            <p class="text-[10px] text-faint">${apiLabel}</p>
+          </div>
+          <button class="ml-auto p-1 rounded text-muted hover:text-ink hover:bg-raised transition-colors" aria-label="Close" onClick=${onClose}>✕</button>
+        </div>
+        <div class="px-4 py-3 flex-1 overflow-y-auto min-h-[140px]">
+          ${request.kind === 'translate' ? html`
+            <div class="flex flex-wrap items-center gap-2 mb-3 text-[10.5px] text-muted">
+              <label class="flex items-center gap-1.5">Source
+                <select class="bg-raised text-ink text-[10.5px] rounded-md px-2 py-1 border border-line outline-none focus:border-accent/70" value=${source} onChange=${(e: Event) => setSource((e.target as HTMLSelectElement).value)}>
+                  ${detectorAvailable ? html`<option value="auto">Auto${detected ? ` (${languageLabel(detected)})` : ''}</option>` : ''}
+                  ${TRANSLATE_LANGUAGES.map(([code, label]) => html`<option value=${code}>${label}</option>`)}
+                </select>
+              </label>
+              <span class="text-faint">→</span>
+              <label class="flex items-center gap-1.5">Target
+                <select class="bg-raised text-ink text-[10.5px] rounded-md px-2 py-1 border border-line outline-none focus:border-accent/70" value=${target} onChange=${(e: Event) => setTarget((e.target as HTMLSelectElement).value)}>
+                  ${TRANSLATE_LANGUAGES.map(([code, label]) => html`<option value=${code}>${label}</option>`)}
+                </select>
+              </label>
+            </div>
+          ` : ''}
+          ${request.kind === 'rewrite' ? html`
+            <div class="flex flex-wrap items-center gap-2 mb-3 text-[10.5px] text-muted">
+              <label class="flex items-center gap-1.5">Tone
+                <select class="bg-raised text-ink text-[10.5px] rounded-md px-2 py-1 border border-line outline-none focus:border-accent/70" value=${tone} onChange=${(e: Event) => setTone((e.target as HTMLSelectElement).value)}>
+                  <option value="more-formal">Formal</option>
+                  <option value="as-is">As written</option>
+                  <option value="more-casual">Casual</option>
+                </select>
+              </label>
+              <label class="flex items-center gap-1.5">Length
+                <select class="bg-raised text-ink text-[10.5px] rounded-md px-2 py-1 border border-line outline-none focus:border-accent/70" value=${length} onChange=${(e: Event) => setLength((e.target as HTMLSelectElement).value)}>
+                  <option value="shorter">Shorter</option>
+                  <option value="as-is">As written</option>
+                  <option value="longer">Longer</option>
+                </select>
+              </label>
+            </div>
+          ` : ''}
+          ${error
+            ? html`<p class="text-[11.5px] leading-relaxed text-danger">${error}</p>`
+            : preparing
+              ? html`<p class="text-[11.5px] text-muted">Working on-device…</p>`
+              : html`<div class="text-[11.5px] leading-relaxed whitespace-pre-wrap text-ink">${output || 'No text returned.'}</div>`}
+          ${request.kind === 'proofread' && !preparing && !error ? html`<p class="mt-3 text-[10px] text-faint">${corrections === 0 ? 'No corrections suggested.' : `${corrections} correction${corrections === 1 ? '' : 's'} suggested.`}</p>` : ''}
+          ${info ? html`<p class="mt-3 text-[10px] text-accent leading-snug">${info}</p>` : ''}
+        </div>
+        <div class="px-4 py-3 border-t border-line flex items-center gap-2 shrink-0">
+          <span class="text-[9.5px] text-faint">Nothing leaves this device</span>
+          <button class="ml-auto px-2.5 py-1 text-[10.5px] rounded-md border border-line bg-raised text-muted hover:text-ink hover:border-line-strong transition-colors disabled:opacity-40" onClick=${copy} disabled=${!output}>${copied ? 'Copied' : 'Copy'}</button>
+          ${request.kind !== 'summarize' && request.kind !== 'summarize-file' ? html`
+            <button class="px-2.5 py-1 text-[10.5px] rounded-md bg-accent hover:bg-accent-strong text-accent-ink font-medium transition-colors disabled:opacity-40" onClick=${() => onReplace(output)} disabled=${!output}>Replace selection</button>
+          ` : ''}
         </div>
       </div>
     </div>
@@ -874,7 +1789,16 @@ function App() {
   const [codeBlocks, setCodeBlocks] = useState<CodeBlock[]>([])
   const [attachContext, setAttachContext] = useState(saved.attachContext ?? true)
   const [customModelUrl, setCustomModelUrl] = useState(saved.customModelUrl || '')
-  const [fileStatus, setFileStatus] = useState('')
+  const [savedFile, setSavedFile] = useState('')
+  const [mobilePanel, setMobilePanel] = useState<'files' | 'chat' | null>(null)
+  const [showBuiltInAI, setShowBuiltInAI] = useState(false)
+  const [builtInTask, setBuiltInTask] = useState<BuiltInActionRequest | null>(null)
+  const [openFiles, setOpenFiles] = useState<string[]>([])
+  const [dirtyFiles, setDirtyFiles] = useState<Set<string>>(new Set())
+  const [quickOpen, setQuickOpen] = useState(false)
+  const [chatDraft, setChatDraft] = useState('')
+  const [sidebarWidth, setSidebarWidth] = useState(() => loadWidth('coder-sidebar-width', 256))
+  const [chatWidth, setChatWidth] = useState(() => loadWidth('coder-chat-width', 380))
   const [notifs, setNotifs] = useState<Notification[]>([])
 
   useEffect(() => {
@@ -886,9 +1810,58 @@ function App() {
     }
   }, [])
 
+  useEffect(() => {
+    onFileSaved = (path) => setSavedFile(path)
+    return () => { onFileSaved = null }
+  }, [])
+
+  useEffect(() => {
+    onBuiltInAction = (request) => setBuiltInTask(request)
+    return () => { onBuiltInAction = null }
+  }, [])
+
+  useEffect(() => {
+    onFileOpened = (path) => setOpenFiles(prev => prev.includes(path) ? prev : [...prev, path])
+    onFileDirtyChanged = (path, dirty) => setDirtyFiles(prev => {
+      if (dirty === prev.has(path)) return prev
+      const next = new Set(prev)
+      if (dirty) next.add(path)
+      else next.delete(path)
+      return next
+    })
+    return () => {
+      onFileOpened = null
+      onFileDirtyChanged = null
+    }
+  }, [])
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('coder-sidebar-width', String(sidebarWidth))
+      localStorage.setItem('coder-chat-width', String(chatWidth))
+    } catch {}
+  }, [sidebarWidth, chatWidth])
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.metaKey || e.ctrlKey) || e.key.toLowerCase() !== 'k') return
+      e.preventDefault()
+      e.stopPropagation()
+      setQuickOpen(open => !open)
+    }
+    window.addEventListener('keydown', onKey, true)
+    return () => window.removeEventListener('keydown', onKey, true)
+  }, [])
+
   const editorRef = useRef<HTMLDivElement | null>(null)
   const abortRef = useRef(false)
   const generatingRef = useRef(false)
+  const closeBuiltInAI = useCallback(() => setShowBuiltInAI(false), [])
+  const closeBuiltInTask = useCallback(() => setBuiltInTask(null), [])
+  const replaceBuiltInSelection = useCallback((text: string) => {
+    if (builtInTask) replaceEditorRange(builtInTask.range, text)
+    setBuiltInTask(null)
+  }, [builtInTask])
 
   useEffect(() => {
     saveState({ selectedProvider, selectedModel, customModelUrl, attachContext, messages })
@@ -944,18 +1917,24 @@ function App() {
   }, [])
 
   const handleOpenFolder = useCallback(async () => {
+    if (dirtyFiles.size > 0 && !window.confirm('Change folder? Unsaved changes will be discarded.')) return
     const entries = await openFolder(setIndexedCount)
     if (!entries) return
+    setMobilePanel(null)
     setIndexedCount(fileHandles.size)
+    editor?.setModel(null)
     for (const m of monacoModels.values()) m.dispose()
     monacoModels.clear()
+    savedContents.clear()
+    setOpenFiles([])
+    setDirtyFiles(new Set())
     setTreeData(entries)
     setExpandedPaths(new Set())
     setSelectedFile(null)
     currentFilePath = null
     currentFileHandle = null
-    setFileStatus('')
-  }, [])
+    setSavedFile('')
+  }, [dirtyFiles])
 
   const handleToggleDir = useCallback((entry: FileEntry) => {
     const path = entry.path
@@ -979,9 +1958,63 @@ function App() {
 
   const handleFileClick = useCallback(async (path: string) => {
     setSelectedFile(path)
-    const ok = await loadFile(path)
-    if (ok) setFileStatus(path)
-  }, [])
+    setSavedFile('')
+    setMobilePanel(null)
+    if (dirtyFiles.has(path) && monacoModels.has(path)) {
+      editor?.setModel(monacoModels.get(path))
+      currentFilePath = path
+      onFileOpened?.(path)
+      return
+    }
+    await loadFile(path)
+  }, [dirtyFiles])
+
+  const handleCloseTab = useCallback((path: string) => {
+    if (dirtyFiles.has(path) && !window.confirm(`Close ${path.split('/').pop() || path} with unsaved changes?`)) return
+    const remaining = openFiles.filter(item => item !== path)
+    const wasActive = selectedFile === path
+    setOpenFiles(remaining)
+    setDirtyFiles(prev => {
+      if (!prev.has(path)) return prev
+      const next = new Set(prev)
+      next.delete(path)
+      return next
+    })
+    if (wasActive) {
+      const index = openFiles.indexOf(path)
+      const fallback = remaining[Math.min(index, remaining.length - 1)] || null
+      setSelectedFile(fallback)
+      setSavedFile('')
+      const model = fallback ? monacoModels.get(fallback) : null
+      if (model) {
+        editor?.setModel(model)
+        currentFilePath = fallback
+      } else if (fallback) {
+        void loadFile(fallback)
+      } else {
+        currentFilePath = null
+        currentFileHandle = null
+        editor?.setModel(null)
+      }
+    }
+    const closedModel = monacoModels.get(path)
+    if (closedModel) {
+      closedModel.dispose()
+      monacoModels.delete(path)
+    }
+    savedContents.delete(path)
+  }, [dirtyFiles, openFiles, selectedFile])
+
+  const summarizeOpenFile = useCallback(() => {
+    if (!selectedFile) return
+    const model = editor?.getModel()
+    const text = model ? model.getValue() : ''
+    if (!text.trim()) {
+      addNotification('This file is empty.', 'info')
+      return
+    }
+    setBuiltInTask({ kind: 'summarize-file', text, path: selectedFile })
+  }, [selectedFile])
 
   const handleSend = useCallback(async (text: string) => {
     if (!currentModel || !modelLoaded || generatingRef.current) return
@@ -1036,6 +2069,15 @@ function App() {
       let full = ''
       for await (const chunk of streamChat(chatMsgs, systemMsg, plainSystem, tools, abortController.signal)) {
         if (abortRef.current) break
+        if (chunk.tool?.ok && chunk.tool.path) {
+          const { name, path } = chunk.tool
+          if (name === 'deleteFile') {
+            setTreeData((prev: FileEntry[] | null) => removeFileFromTree(prev, path))
+          } else if (name === 'createFile' || name === 'editFile' || name === 'replaceInFile') {
+            const entry = fileHandles.get(path)
+            if (entry) setTreeData((prev: FileEntry[] | null) => addFileToTree(prev, path, entry))
+          }
+        }
         full = chunk.text
         setStreamingContent(full)
         const bl = parseCodeBlocks(full)
@@ -1068,12 +2110,50 @@ function App() {
 
   const handleStop = useCallback(() => { abortRef.current = true; stopGeneration() }, [])
   const handleClear = useCallback(() => { setMessages([]); setStreamingContent(''); setCodeBlocks([]); saveState({ messages: [] }) }, [])
+  const consumeChatDraft = useCallback(() => setChatDraft(''), [])
+
+  useEffect(() => {
+    onSelectionAction = (kind, text, path) => {
+      const instruction = kind === 'explain'
+        ? 'Explain what this code does, call out non-obvious behavior, and flag anything that looks wrong.'
+        : kind === 'refactor'
+          ? 'Refactor this code for clarity and correctness. Keep the public behavior identical and apply the minimal change.'
+          : 'Add focused tests for this code, covering edge cases and failure modes.'
+      const clipped = text.length > 8000 ? `${text.slice(0, 8000)}\n…[selection truncated]` : text
+      const prompt = `${instruction}${path ? `\n\nFile: ${path}` : ''}\n\n\`\`\`\n${clipped}\n\`\`\``
+      setMobilePanel('chat')
+      if (!modelLoaded) {
+        addNotification('Load a model first; the prompt is ready in the chat box.', 'warning')
+        setChatDraft(prompt)
+        return
+      }
+      setChatDraft('')
+      void handleSend(prompt)
+    }
+    return () => { onSelectionAction = null }
+  }, [modelLoaded, handleSend])
+
+  const handleExportChat = useCallback(() => {
+    if (!messages.length) return
+    const body = messages
+      .map(message => `## ${message.role === 'user' ? 'You' : 'Coder'}\n\n${message.content}`)
+      .join('\n\n---\n\n')
+    const blob = new Blob([`# Coder conversation\n\n${body}\n`], { type: 'text/markdown;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `coder-chat-${new Date().toISOString().slice(0, 10)}.md`
+    link.click()
+    URL.revokeObjectURL(url)
+  }, [messages])
 
   const handleApply = useCallback(async (path: string, code: string) => {
     const ok = await applyFileChanges(path, code)
     if (ok) {
+      const entry = fileHandles.get(path)
+      if (entry) setTreeData((prev: FileEntry[] | null) => addFileToTree(prev, path, entry))
       setCodeBlocks((prev: CodeBlock[]) => prev.map((b: CodeBlock) => (b.path===path && b.code===code) ? { ...b, applied: true } : b))
-      if (path === currentFilePath) setFileStatus(path)
+      if (path === currentFilePath) setSavedFile(path)
     }
   }, [])
 
@@ -1114,49 +2194,121 @@ function App() {
     } finally { setModelLoading(false) }
   }, [selectedModel, selectedProvider, customModelUrl])
 
-  const sidebarProps: SidebarProps = { treeData, indexedCount, expandedPaths, onToggleDir: handleToggleDir, onFileClick: handleFileClick, selectedFile, modelList, selectedModel, onModelChange: m => { setSelectedModel(m); setModelLoaded(false) }, modelLoaded, modelLoading, initProgress, onLoadModel: handleLoadModel, onOpenFolder: handleOpenFolder, attachContext, onAttachContextChange: setAttachContext, customModelUrl, onCustomModel: setCustomModelUrl, selectedProvider, onProviderChange: p => { if (p === PROVIDERS.BROWSER_AI && !window.__browserAiAvailable) return; setSelectedProvider(p); setSelectedModel(''); setModelLoaded(false); const models = getAvailableModels(4096); const first = models.find(m => m.provider === p); if (first) setSelectedModel(first.id) } }
+  const sidebarProps: SidebarProps = { treeData, indexedCount, expandedPaths, onToggleDir: handleToggleDir, onFileClick: handleFileClick, selectedFile, modelList, selectedModel, onModelChange: m => { setSelectedModel(m); setModelLoaded(false) }, modelLoaded, modelLoading, initProgress, onLoadModel: handleLoadModel, onOpenFolder: handleOpenFolder, attachContext, onAttachContextChange: setAttachContext, customModelUrl, onCustomModel: setCustomModelUrl, selectedProvider, onProviderChange: p => { if (p === PROVIDERS.BROWSER_AI && !window.__browserAiAvailable) return; setSelectedProvider(p); setSelectedModel(''); setModelLoaded(false); const models = getAvailableModels(4096); const first = models.find(m => m.provider === p); if (first) setSelectedModel(first.id) }, onShowBuiltInAI: () => setShowBuiltInAI(true) }
 
-  const chatProps: ChatPanelProps = { messages, streamingContent, codeBlocks, isGenerating, onSend: handleSend, onStop: handleStop, onApply: handleApply, onClear: handleClear, modelLoaded }
+  const chatProps: ChatPanelProps = { messages, streamingContent, codeBlocks, isGenerating, onSend: handleSend, onStop: handleStop, onApply: handleApply, onClear: handleClear, onExport: handleExportChat, modelLoaded, draft: chatDraft, onDraftConsumed: consumeChatDraft }
+  const quickFiles = useMemo(() => quickOpen ? [...fileHandles.keys()].sort() : [], [quickOpen, indexedCount])
+  const modelLabel = modelList.find(m => m.id === selectedModel)?.label || selectedModel
 
   return html`
-    <div class="h-screen flex flex-col bg-[#1e1e1e] text-gray-200 text-sm">
+    <div class="h-screen flex flex-col bg-canvas text-ink">
       ${notifs.length > 0 ? html`
-        <div class="fixed top-12 right-4 z-50 space-y-2 max-w-sm">
+        <div class="fixed top-14 right-4 z-50 space-y-2 max-w-sm">
           ${notifs.map(n => html`
-            <div key=${n.id} class="px-3 py-2 rounded text-xs border ${n.level === 'warning' ? 'bg-yellow-900/90 border-yellow-700 text-yellow-200' : n.level === 'error' ? 'bg-red-900/90 border-red-700 text-red-200' : 'bg-blue-900/90 border-blue-700 text-blue-200'}">
-              <div class="font-medium mb-0.5">${n.level === 'warning' ? '⚠️ Warning' : n.level === 'error' ? '❌ Error' : 'ℹ️ Info'}</div>
-              <div class="opacity-90">${n.text}</div>
+            <div key=${n.id} class="px-3 py-2 rounded-lg text-[11.5px] bg-panel/95 backdrop-blur border border-line shadow-lg ${n.level === 'warning' ? 'border-l-2 border-l-accent' : n.level === 'error' ? 'border-l-2 border-l-danger' : 'border-l-2 border-l-ok'}">
+              <div class="font-medium text-ink mb-0.5">${n.level === 'warning' ? 'Warning' : n.level === 'error' ? 'Error' : 'Info'}</div>
+              <div class="text-muted leading-snug">${n.text}</div>
             </div>
           `)}
         </div>
       ` : ''}
-      <header class="h-9 bg-[#1e1e1e] border-b border-[#3c3c3c] flex items-center px-4 shrink-0">
-        <span class="font-semibold text-gray-200 text-sm tracking-wide">Coder</span>
-        <span class="text-xs text-gray-500 ml-3 hidden sm:inline">Local-First AI Editor</span>
-        <div class="ml-auto flex items-center gap-3 text-xs text-gray-500">
-          ${modelLoaded ? html`<span class="text-green-500">● Model Ready</span>` : ''}
-          ${fileStatus ? html`<span class="text-gray-400 truncate max-w-[200px]" title=${fileStatus}>${fileStatus}</span>` : ''}
+      <header class="h-11 bg-panel border-b border-line flex items-center gap-2.5 px-3 shrink-0 select-none">
+        <${Logo} class="w-5 h-5" />
+        <span class="font-semibold text-ink text-[12.5px] tracking-tight">Coder</span>
+        <span class="hidden sm:inline text-[9px] font-medium uppercase tracking-[0.16em] text-faint border border-line rounded px-1.5 py-[1px]">Local-first</span>
+        <div class="ml-auto flex items-center gap-1.5 md:gap-3 text-[11px] min-w-0">
+          <div class="hidden md:flex items-center gap-3 min-w-0">
+            ${modelLoaded ? html`<span class="inline-flex items-center gap-1.5 text-muted min-w-0"><span class="w-1.5 h-1.5 rounded-full bg-ok shrink-0"></span><span class="truncate max-w-[220px]">${modelLabel}</span></span>` : ''}
+            ${savedFile ? html`<span class="inline-flex items-center gap-1.5 text-muted min-w-0" title=${savedFile}><${CheckIcon} class="w-3 h-3 text-ok shrink-0" /><span>Saved</span></span>` : ''}
+          </div>
+          <button
+            class="md:hidden p-1.5 rounded-md border transition-colors ${mobilePanel === 'files' ? 'border-accent/60 bg-accent/10 text-accent' : 'border-line bg-raised text-muted hover:text-ink'}"
+            aria-label="Project files"
+            aria-pressed=${mobilePanel === 'files'}
+            onClick=${() => setMobilePanel(p => p === 'files' ? null : 'files')}
+          ><${FolderIcon} /></button>
+          <button
+            class="md:hidden p-1.5 rounded-md border transition-colors ${mobilePanel === 'chat' ? 'border-accent/60 bg-accent/10 text-accent' : 'border-line bg-raised text-muted hover:text-ink'}"
+            aria-label="Chat"
+            aria-pressed=${mobilePanel === 'chat'}
+            onClick=${() => setMobilePanel(p => p === 'chat' ? null : 'chat')}
+          ><${ChatIcon} /></button>
         </div>
       </header>
-      <div class="flex-1 flex overflow-hidden">
-        <div class="w-64 shrink-0 border-r border-[#3c3c3c] flex flex-col bg-[#252526] overflow-hidden">
+      <div class="flex-1 flex overflow-hidden relative">
+        ${mobilePanel ? html`<div key="backdrop" class="md:hidden absolute inset-0 z-20 bg-black/60" onClick=${() => setMobilePanel(null)} />` : ''}
+        <div key="sidebar" style=${`--sidebar-width:${sidebarWidth}px`} class="${mobilePanel === 'files' ? 'flex' : 'hidden'} md:flex absolute inset-y-0 left-0 z-30 w-72 max-w-[85vw] md:static md:z-auto md:max-w-none md:w-[var(--sidebar-width)] shrink-0 border-r border-line md:border-r-0 flex-col bg-panel overflow-hidden shadow-2xl md:shadow-none">
           <${Sidebar} ...${sidebarProps} />
         </div>
-        <div ref=${editorRef} class="flex-1 overflow-hidden relative bg-[#1e1e1e]">
-          ${!treeData ? html`
-            <div class="absolute inset-0 flex items-center justify-center bg-[#1e1e1e] z-10">
-              <div class="text-center p-8">
-                <div class="text-4xl mb-4">⚡</div>
-                <p class="text-gray-400 text-sm mb-4">Open a local folder to start editing</p>
-                <button class="px-5 py-2 bg-blue-600 hover:bg-blue-700 text-white text-sm rounded transition-colors" onClick=${handleOpenFolder}>📂 Open Local Folder</button>
-              </div>
+        <${ResizeHandle} width=${sidebarWidth} min=${200} max=${420} onWidth=${setSidebarWidth} />
+        <div key="editor" class="flex-1 flex flex-col overflow-hidden bg-canvas min-w-0">
+          <div class="h-10 border-b border-line flex items-stretch shrink-0 select-none bg-panel overflow-hidden">
+            <div class="flex-1 flex items-stretch overflow-x-auto no-scrollbar">
+              ${openFiles.length === 0
+                ? html`<span class="px-3 flex items-center text-[10px] font-semibold uppercase tracking-[0.16em] text-faint">Editor</span>`
+                : openFiles.map(path => {
+                    const active = path === selectedFile
+                    const name = path.split('/').pop() || path
+                    return html`<div
+                      key=${path}
+                      class="group flex items-center gap-1.5 pl-3 pr-1.5 border-r border-line cursor-pointer transition-colors ${active ? 'bg-canvas text-ink shadow-[inset_0_-2px_0_var(--color-accent)]' : 'text-muted hover:text-ink hover:bg-hover'}"
+                      onClick=${() => handleFileClick(path)}
+                      title=${path}
+                    >
+                      <span class="text-[11px] truncate max-w-[220px]">${path}</span>
+                      ${dirtyFiles.has(path) ? html`<span class="w-1.5 h-1.5 rounded-full bg-accent shrink-0" title="Unsaved changes"></span>` : ''}
+                      <button
+                        class="p-0.5 rounded text-faint hover:text-ink hover:bg-raised transition-opacity ${active ? 'opacity-100' : 'opacity-100 md:opacity-0 md:group-hover:opacity-100'}"
+                        aria-label=${`Close ${name}`}
+                        onClick=${(e: Event) => { e.stopPropagation(); handleCloseTab(path) }}
+                      >✕</button>
+                    </div>`
+                  })}
             </div>
-          ` : ''}
+            <div class="flex items-center gap-0.5 px-1.5 shrink-0">
+              ${selectedFile && hasBuiltInApi('Summarizer') ? html`
+                <button class="flex items-center gap-1.5 px-2 py-1 rounded-md text-[10.5px] text-muted hover:text-ink hover:bg-raised transition-colors" onClick=${summarizeOpenFile} title="Summarize this file on-device" aria-label="Summarize current file">
+                  <${SparkIcon} class="w-3 h-3" /><span class="hidden lg:inline">Summarize</span>
+                </button>` : ''}
+              <button class="flex items-center gap-1.5 px-2 py-1 rounded-md text-[10.5px] text-faint hover:text-ink hover:bg-raised transition-colors" onClick=${() => setQuickOpen(true)} title="Open file (Ctrl/Cmd+K)" aria-label="Open file (Ctrl/Cmd+K)">
+                <${SearchIcon} class="w-3 h-3" /><span class="font-mono hidden lg:inline">${IS_MAC ? '⌘K' : 'Ctrl K'}</span>
+              </button>
+            </div>
+          </div>
+          <div class="flex-1 relative overflow-hidden">
+            <div ref=${editorRef} class="absolute inset-0"></div>
+            ${!treeData ? html`
+              <div class="absolute inset-0 flex items-center justify-center bg-canvas z-10">
+                <div class="text-center max-w-sm px-6">
+                  <${Logo} class="w-12 h-12 mx-auto mb-5" />
+                  <h1 class="text-ink text-[15px] font-semibold tracking-tight">A local-first AI editor</h1>
+                  <p class="mt-2 text-[11.5px] leading-relaxed text-muted">Open a folder to browse and edit files with an assistant that runs entirely in your browser. Nothing is uploaded.</p>
+                  <button class="mt-5 inline-flex items-center gap-2 px-4 py-2 bg-accent hover:bg-accent-strong text-accent-ink text-[12px] font-medium rounded-lg transition-colors" onClick=${handleOpenFolder}>
+                    <${FolderPlusIcon} class="w-4 h-4" />
+                    <span>Open folder</span>
+                  </button>
+                  <p class="mt-4 text-[10px] text-faint">Chromium-based browser · files stay on this device</p>
+                </div>
+              </div>
+            ` : !selectedFile ? html`
+              <div class="absolute inset-0 flex items-center justify-center bg-canvas z-10 pointer-events-none">
+                <div class="text-center">
+                  <${FileIcon} class="w-6 h-6 mx-auto text-faint" />
+                  <p class="mt-2.5 text-[11.5px] text-muted">Select a file to start editing</p>
+                  <p class="mt-1 text-[10.5px] text-faint">${rootDirName} is indexed for the assistant</p>
+                </div>
+              </div>
+            ` : ''}
+          </div>
         </div>
-        <div class="w-[380px] shrink-0 border-l border-[#3c3c3c] flex flex-col bg-[#1e1e1e] overflow-hidden hidden md:flex">
+        <${ResizeHandle} width=${chatWidth} min=${280} max=${620} invert onWidth=${setChatWidth} />
+        <div key="chat" style=${`--chat-width:${chatWidth}px`} class="${mobilePanel === 'chat' ? 'flex' : 'hidden'} md:flex absolute inset-y-0 right-0 z-30 w-full md:static md:z-auto md:w-[var(--chat-width)] shrink-0 border-l border-line md:border-l-0 flex-col bg-panel overflow-hidden shadow-2xl md:shadow-none">
           <${ChatPanel} ...${chatProps} />
         </div>
       </div>
+      ${quickOpen ? html`<${QuickOpen} files=${quickFiles} onSelect=${(path: string) => { setQuickOpen(false); void handleFileClick(path) }} onClose=${() => setQuickOpen(false)} />` : ''}
+      ${showBuiltInAI ? html`<${BuiltInAIPanel} onClose=${closeBuiltInAI} />` : ''}
+      ${builtInTask ? html`<${BuiltInTaskDialog} request=${builtInTask} onClose=${closeBuiltInTask} onReplace=${replaceBuiltInSelection} />` : ''}
     </div>
   `
 }
@@ -1188,6 +2340,22 @@ async function checkAvailability() {
   window.__browserAiAvailable = await hasBrowserAI()
 }
 
+function errorText(value: unknown): string {
+  if (value instanceof Error) return value.message
+  if (typeof value === 'string') return value
+  try { return JSON.stringify(value) } catch { return String(value) }
+}
+
+window.addEventListener('unhandledrejection', (event) => {
+  addNotification(`Unhandled error: ${errorText(event.reason)}`, 'error')
+})
+
+window.addEventListener('error', (event) => {
+  if (event.message) addNotification(`UI error: ${event.message}`, 'error')
+})
+
 checkAvailability().then(() => {
-  render(html`<${App} />`, document.getElementById('root')!)
+  const root = document.getElementById('root')
+  if (!root) return
+  render(html`<${ErrorBoundary}><${App} /></${ErrorBoundary}>`, root)
 })

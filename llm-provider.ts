@@ -1,4 +1,4 @@
-import { streamText, jsonSchema, type ModelMessage, type LanguageModel } from 'ai'
+import { streamText, jsonSchema, stepCountIs, type ModelMessage, type LanguageModel } from 'ai'
 import { browserAI, doesBrowserSupportBrowserAI } from '@browser-ai/core'
 import { webLLM, doesBrowserSupportWebLLM } from '@browser-ai/web-llm'
 import { transformersJS, doesBrowserSupportTransformersJS } from '@browser-ai/transformers-js'
@@ -173,9 +173,7 @@ function isLinux(): boolean {
   }
 }
 
-function chromiumMessage(): string {
-  return 'This looks like open-source Chromium, which does not ship Google\u2019s proprietary on-device model (Gemini Nano). Chrome Built-in AI only works in official Google Chrome (138+ on desktop) with the model downloaded and the Prompt API enabled. On this browser use WebLLM (needs WebGPU) or Transformers.js (runs on CPU) instead.'
-}
+const CHROMIUM_MESSAGE = 'This looks like open-source Chromium, which does not ship Google\u2019s proprietary on-device model (Gemini Nano). Built-in AI only exists in official Google Chrome on desktop \u2014 the Prompt API is stable on the web in Chrome 148+ (Chrome 138+ in extensions), while Summarizer, Translator, and Language Detector are stable in Chrome 138+. Use WebLLM (needs WebGPU) or Transformers.js (runs on CPU) on this browser instead.'
 
 /**
  * Thorough Chrome Built-in AI check. `doesBrowserSupportBrowserAI()` only
@@ -193,12 +191,12 @@ export async function getBrowserAIStatus(): Promise<BrowserAIDetail> {
   }
   if (!doesBrowserSupportBrowserAI()) {
     if (isChromiumWithoutChrome()) {
-      return { status: 'unsupported', short: 'Chrome AI (needs Google Chrome)', message: chromiumMessage() }
+      return { status: 'unsupported', short: 'Chrome AI (needs Google Chrome)', message: CHROMIUM_MESSAGE }
     }
     return {
       status: 'unsupported',
       short: 'Chrome AI (not available)',
-      message: 'This browser does not expose the Prompt API (`LanguageModel` global is missing). Chrome Built-in AI needs official Google Chrome 138+ or Edge 138+ on desktop, a secure context (HTTPS/localhost), and the on-device model enabled under chrome://flags. Use WebLLM or Transformers.js instead.',
+      message: 'This browser does not expose the Prompt API (`LanguageModel` global is missing). On the web the Prompt API is stable in Chrome 148+ (Chrome 138+ in extensions); Summarizer, Translator, and Language Detector are stable in Chrome 138+. Built-in AI also requires a secure context (HTTPS/localhost) and the on-device model. Use WebLLM or Transformers.js instead.',
     }
   }
   try {
@@ -211,24 +209,127 @@ export async function getBrowserAIStatus(): Promise<BrowserAIDetail> {
       return {
         status: 'needs-download',
         short: 'Chrome AI (model download needed)',
-        message: `The browser exposes the Prompt API but the on-device model is not ready yet (status: ${availability}). Click Load Model and wait for the download to finish.${linuxNote} Make sure the Prompt API flags are enabled and there is enough free disk space.`,
+        message: `The browser exposes the Prompt API but the on-device model is not ready yet (status: ${availability}). Click Load Model and keep the tab open while Chrome downloads it.${linuxNote} Check that Chrome has enough free disk space.`,
       }
     }
     if (isChromiumWithoutChrome()) {
-      return { status: 'unavailable', short: 'Chrome AI (needs Google Chrome)', message: chromiumMessage() }
+      return { status: 'unavailable', short: 'Chrome AI (needs Google Chrome)', message: CHROMIUM_MESSAGE }
     }
     return {
       status: 'unavailable',
       short: 'Chrome AI (unavailable)',
-      message: 'The browser exposes the Prompt API but reports the on-device model as unavailable. In official Chrome: enable the Prompt API flags under chrome://flags, then open chrome://components and make sure “Optimization Guide On Device Model” is downloaded (this component does not exist in open-source Chromium). On Linux also check you have several GB of free disk space.',
+      message: 'The browser exposes the Prompt API but reports the on-device model as unavailable. Update Chrome and check chrome://components → “Optimization Guide On Device Model” (this component does not exist in open-source Chromium). On Linux also check you have several GB of free disk space.',
     }
   } catch {
     return {
       status: 'unsupported',
       short: 'Chrome AI (not available)',
-      message: 'Could not query the Prompt API status. Chrome Built-in AI needs official Google Chrome 138+ on desktop with the on-device model enabled. Use WebLLM or Transformers.js instead.',
+      message: 'Could not query the Prompt API status. On the web the Prompt API is stable in Chrome 148+ on desktop. Use WebLLM or Transformers.js instead.',
     }
   }
+}
+
+export type BuiltInApiStatus = 'available' | 'downloadable' | 'downloading' | 'unavailable' | 'unsupported'
+
+export interface BuiltInApiInfo {
+  id: string
+  label: string
+  description: string
+  status: BuiltInApiStatus
+  note?: string
+}
+
+/**
+ * Probes one built-in AI API by its global constructor. APIs are shipped at
+ * different stages and Chromium builds omit them entirely, so the only honest
+ * signal is the global plus `availability()`; a missing `availability()` is
+ * treated as available (older revisions).
+ */
+async function probeBuiltInApi(globalName: string, options?: Record<string, string>): Promise<BuiltInApiStatus> {
+  // `globalThis` has no index signature; names come from the fixed list below.
+  const globals = globalThis as unknown as Record<string, unknown>
+  const ctor = globals[globalName]
+  if (typeof ctor !== 'function') return 'unsupported'
+  if (!('availability' in ctor)) return 'available'
+  const probe: unknown = ctor.availability
+  if (typeof probe !== 'function') return 'available'
+  try {
+    const status: unknown = await Reflect.apply(probe, ctor, [options])
+    if (status === 'available') return 'available'
+    if (status === 'downloadable' || status === 'available-after-download') return 'downloadable'
+    if (status === 'downloading') return 'downloading'
+    return 'unavailable'
+  } catch {
+    return 'unavailable'
+  }
+}
+
+/**
+ * Live matrix of the browser's built-in AI APIs. The Translator probe uses an
+ * English → Spanish pair because its availability is per language pair.
+ */
+export async function getBuiltInAICapabilities(): Promise<BuiltInApiInfo[]> {
+  const [prompt, summarizer, translator, languageDetector, writer, rewriter, proofreader] = await Promise.all([
+    probeBuiltInApi('LanguageModel'),
+    probeBuiltInApi('Summarizer'),
+    probeBuiltInApi('Translator', { sourceLanguage: 'en', targetLanguage: 'es' }),
+    probeBuiltInApi('LanguageDetector'),
+    probeBuiltInApi('Writer'),
+    probeBuiltInApi('Rewriter'),
+    probeBuiltInApi('Proofreader'),
+  ])
+
+  return [
+    {
+      id: 'prompt',
+      label: 'Prompt API',
+      description: 'Free-form prompts, tool use, and image input. Powers chat and file edits.',
+      status: prompt,
+      note: 'Stable on the web in Chrome 148+; Chrome 138+ in extensions.',
+    },
+    {
+      id: 'summarizer',
+      label: 'Summarizer',
+      description: 'Condense long files or conversations into key points. Also available by right-clicking a selection.',
+      status: summarizer,
+      note: 'Stable in Chrome 138+.',
+    },
+    {
+      id: 'translator',
+      label: 'Translator',
+      description: 'Translate a selection on-device. Availability is per language pair; also in the editor context menu.',
+      status: translator,
+      note: 'Stable in Chrome 138+.',
+    },
+    {
+      id: 'language-detector',
+      label: 'Language Detector',
+      description: 'Identify the language of a text, for example before translating it.',
+      status: languageDetector,
+      note: 'Stable in Chrome 138+.',
+    },
+    {
+      id: 'writer',
+      label: 'Writer',
+      description: 'Draft new text such as commit messages, docstrings, or release notes.',
+      status: writer,
+      note: 'Developer trial.',
+    },
+    {
+      id: 'rewriter',
+      label: 'Rewriter',
+      description: 'Shorten, expand, or change the tone of selected text.',
+      status: rewriter,
+      note: 'Developer trial.',
+    },
+    {
+      id: 'proofreader',
+      label: 'Proofreader',
+      description: 'Grammar and spelling corrections with explanations for docs and comments.',
+      status: proofreader,
+      note: 'Origin trial.',
+    },
+  ]
 }
 
 export function getProviderLabel(provider: Provider): string {
@@ -248,7 +349,7 @@ export async function initProviderModel(
   switch (provider) {
     case PROVIDERS.BROWSER_AI: {
       if (!doesBrowserSupportBrowserAI()) {
-        throw new Error('Browser AI is not supported in this browser. Use Chrome 127+ or Edge 127+ with AI features enabled.')
+        throw new Error('Browser AI is not supported in this browser. On the web the Prompt API is stable in Chrome 148+ on desktop (Chrome 138+ in extensions); identical APIs are not available in open-source Chromium. Use WebLLM or Transformers.js instead.')
       }
       // Do NOT keep a pre-created session: the underlying SessionManager
       // caches the first session and ignores the system prompt on later
@@ -279,15 +380,26 @@ export async function initProviderModel(
           onProgress?.({ text: r.text || `Loading ${modelId}...`, progress: r.progress || 0 })
         },
       })
-      await new Promise(resolve => setTimeout(resolve, 100))
+      // webLLM() returns a lazy model: the engine (download + WebGPU init) is
+      // only created on the first generate call. Force it here so "Load model"
+      // actually finishes the load and surfaces progress. With no callback,
+      // createSessionWithProgress falls back to initProgressCallback above,
+      // which keeps the engine's descriptive progress text.
+      await model.createSessionWithProgress()
       return model
     }
     case PROVIDERS.TRANSFORMERS_JS: {
-      return transformersJS(modelId, {
+      const model = transformersJS(modelId, {
         initProgressCallback: (p) => {
           onProgress?.({ text: `Loading ${modelId}...`, progress: typeof p === 'number' ? p : 0 })
         },
       })
+      // Same lazy behavior: transformersJS() only constructs the wrapper, the
+      // tokenizer/weights load on first use. Do it during Load model.
+      await model.createSessionWithProgress((p) => {
+        onProgress?.({ text: `Loading ${modelId}...`, progress: typeof p === 'number' ? p : 0 })
+      })
+      return model
     }
     default:
       throw new Error(`Unknown provider: ${provider}`)
@@ -373,6 +485,8 @@ export function createChatStream({ provider, model, messages, system, tools, abo
   const chatModel = model || (provider === PROVIDERS.BROWSER_AI ? browserAI() : null)
   if (!chatModel) throw new Error(`Model not initialized for provider: ${provider}`)
 
+  const hasTools = !!tools && Object.keys(tools).length > 0
+
   // Chrome Built-in AI normally runs through the native Prompt API harness in
   // chrome-harness.ts (native tool use). This AI SDK path remains as the
   // generic fallback for providers that implement LanguageModelV3.
@@ -384,6 +498,9 @@ export function createChatStream({ provider, model, messages, system, tools, abo
     maxOutputTokens: 4096,
     topP: 0.95,
     tools: tools as any,
+    // Without this the SDK stops after the first tool call and never produces
+    // the follow-up answer that consumes the tool result.
+    stopWhen: hasTools ? stepCountIs(8) : undefined,
     allowSystemInMessages: true,
     abortSignal,
   })
