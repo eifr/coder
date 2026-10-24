@@ -100,6 +100,9 @@ interface PersistedState {
   attachContext: boolean
   modelAreaHidden: boolean
   messages: Message[]
+  openFiles: string[]
+  selectedFile: string | null
+  projectName: string
 }
 
 function loadState(): Partial<PersistedState> {
@@ -274,6 +277,7 @@ Rules:
 - When done, list exactly which files changed and what changed in each.`
 
 let editor: any = null
+let editorReadyPromise: Promise<void> | null = null
 let currentFilePath: string | null = null
 let currentFileHandle: FileSystemFileHandle | null = null
 let rootDirHandle: FileSystemDirectoryHandle | null = null
@@ -2007,6 +2011,13 @@ function App() {
     saveState({ selectedProvider, selectedModel, customModelUrl, attachContext, modelAreaHidden, messages })
   }, [selectedProvider, selectedModel, customModelUrl, attachContext, modelAreaHidden, messages])
 
+  // Open tabs only make sense with a project loaded; saving them earlier would
+  // overwrite the snapshot before the restore effect gets to read it.
+  useEffect(() => {
+    if (!treeData) return
+    saveState({ openFiles, selectedFile, projectName: rootDirName })
+  }, [treeData, openFiles, selectedFile])
+
   useEffect(() => {
     (async () => {
       try {
@@ -2053,7 +2064,7 @@ function App() {
   }, [])
 
   useEffect(() => {
-    initMonaco(editorRef.current!).then(() => {})
+    editorReadyPromise = initMonaco(editorRef.current!).then(() => {})
   }, [])
 
   const applyFolder = useCallback((entries: FileEntry[]) => {
@@ -2074,6 +2085,21 @@ function App() {
     setRestorableProject(null)
   }, [])
 
+  const restoreTabs = useCallback(async (files: string[], active: string | null) => {
+    if (editorReadyPromise) await editorReadyPromise
+    const valid: string[] = []
+    for (const path of files) {
+      if (await loadFile(path)) valid.push(path)
+    }
+    setOpenFiles(valid)
+    const target = active && valid.includes(active) ? active : valid[valid.length - 1] ?? null
+    setSelectedFile(target)
+    if (target) {
+      setSavedFile('')
+      await loadFile(target)
+    }
+  }, [])
+
   const handleOpenFolder = useCallback(async () => {
     if (dirtyFiles.size > 0 && !window.confirm('Change folder? Unsaved changes will be discarded.')) return
     const entries = await openFolder(setIndexedCount)
@@ -2092,7 +2118,14 @@ function App() {
         const permission = await handle.queryPermission({ mode: 'readwrite' })
         if (permission === 'granted') {
           const entries = await activateFolder(handle, setIndexedCount)
-          if (entries && alive) applyFolder(entries)
+          if (entries && alive) {
+            applyFolder(entries)
+            if (saved.projectName === handle.name) {
+              const files = [...(saved.openFiles ?? [])]
+              if (saved.selectedFile && !files.includes(saved.selectedFile)) files.push(saved.selectedFile)
+              void restoreTabs(files, saved.selectedFile ?? null)
+            }
+          }
         } else if (permission === 'prompt') {
           setRestorableProject(handle.name)
         } else {
@@ -2104,7 +2137,7 @@ function App() {
       }
     })()
     return () => { alive = false }
-  }, [applyFolder])
+  }, [applyFolder, restoreTabs])
 
   const handleRestoreProject = useCallback(async () => {
     const handle = await readStoredRootHandle()
@@ -2118,14 +2151,21 @@ function App() {
         return
       }
       const entries = await activateFolder(handle, setIndexedCount)
-      if (entries) applyFolder(entries)
+      if (entries) {
+        applyFolder(entries)
+        if (saved.projectName === handle.name) {
+          const files = [...(saved.openFiles ?? [])]
+          if (saved.selectedFile && !files.includes(saved.selectedFile)) files.push(saved.selectedFile)
+          void restoreTabs(files, saved.selectedFile ?? null)
+        }
+      }
     } catch (err) {
       console.error('restore folder:', err)
       addNotification(`Could not reopen ${handle.name}.`, 'error')
       void clearStoredRootHandle()
       setRestorableProject(null)
     }
-  }, [applyFolder])
+  }, [applyFolder, restoreTabs])
 
   const handleToggleDir = useCallback((entry: FileEntry) => {
     const path = entry.path
