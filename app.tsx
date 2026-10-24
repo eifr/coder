@@ -1,6 +1,9 @@
 import { html, render, Component, useState, useEffect, useRef, useCallback, useMemo } from 'htm/preact/standalone.mjs'
 import { PROVIDERS, getAvailableModels, estimateVRAM, getPreferredModel, checkProviderAvailability, getBrowserAIStatus, getBuiltInAICapabilities, getProviderLabel, initProviderModel, createChatStream, createTools, type Provider, type ModelDescriptor, type BuiltInApiInfo, type BuiltInApiStatus } from './llm-provider'
-import { createHarnessTools, streamChromeHarness, type HarnessTool } from './chrome-harness'
+import { createHarnessTools, type HarnessTool } from './chrome-harness'
+import { Agent, type AgentMessage, type AgentTool } from '@earendil-works/pi-agent-core'
+import { Type } from '@earendil-works/pi-ai'
+import { CHROME_API, MODEL_ID, PROVIDER_ID, createChromeModels } from './pi-chrome-provider'
 import type { LanguageModel, ModelMessage } from 'ai'
 
 interface Notification {
@@ -779,42 +782,233 @@ function stopGeneration(): void {
   }
 }
 
+const CHROME_MODEL = createChromeModels()
+const MAX_AGENT_TURNS = 8
+const MAX_AGENT_TOOL_RESULT = 24000
+
+function modelContentText(content: unknown): string {
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return ''
+  return content.map(part => {
+    if (!part || typeof part !== 'object') return ''
+    if ('type' in part && part.type === 'text' && 'text' in part && typeof part.text === 'string') return part.text
+    return ''
+  }).join('')
+}
+
+function toAgentHistory(messages: ModelMessage[]): AgentMessage[] {
+  const history: AgentMessage[] = []
+  for (const message of messages) {
+    if (message.role !== 'user' && message.role !== 'assistant') continue
+    const text = modelContentText(message.content)
+    if (message.role === 'user') {
+      history.push({ role: 'user', content: text, timestamp: Date.now() })
+      continue
+    }
+    history.push({
+      role: 'assistant',
+      content: [{ type: 'text', text }],
+      api: CHROME_API,
+      provider: PROVIDER_ID,
+      model: MODEL_ID,
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+      stopReason: 'stop',
+      timestamp: Date.now(),
+    })
+  }
+  return history
+}
+
+function toAgentTool(tool: HarnessTool): AgentTool {
+  return {
+    name: tool.name,
+    label: tool.name,
+    description: tool.description,
+    parameters: Type.Unsafe(tool.inputSchema),
+    execute: async (_toolCallId, params) => {
+      // pi validated the arguments against the same JSON Schema the app declares.
+      const args = params as Record<string, unknown>
+      const value = await tool.execute(args)
+      const text = typeof value === 'string' ? value : JSON.stringify(value, null, 2) ?? 'null'
+      return {
+        content: [{
+          type: 'text',
+          text: text.length > MAX_AGENT_TOOL_RESULT
+            ? `${text.slice(0, MAX_AGENT_TOOL_RESULT)}\n…[truncated ${text.length - MAX_AGENT_TOOL_RESULT} characters]`
+            : text,
+        }],
+        details: undefined,
+      }
+    },
+  }
+}
+
+function toolPathFromArgs(args: unknown): string | undefined {
+  if (!args || typeof args !== 'object' || !('path' in args) || typeof args.path !== 'string') return undefined
+  return args.path.replace(/\\/g, '/').replace(/^\.?\//, '').replace(/\/+$/, '')
+}
+
+interface ChunkQueue {
+  push(chunk: ChatChunk): void
+  close(): void
+  drain(): AsyncGenerator<ChatChunk>
+}
+
+/**
+ * Bridges pi's subscription callbacks to the async generator the chat UI
+ * consumes. `push` is called from agent events; `drain` is called by streamChat.
+ */
+function createChunkQueue(): ChunkQueue {
+  const chunks: ChatChunk[] = []
+  let wake: (() => void) | null = null
+  let closed = false
+  return {
+    push(chunk) {
+      chunks.push(chunk)
+      wake?.()
+      wake = null
+    },
+    close() {
+      closed = true
+      wake?.()
+      wake = null
+    },
+    async *drain() {
+      while (true) {
+        const chunk = chunks.shift()
+        if (chunk) {
+          yield chunk
+          continue
+        }
+        if (closed) return
+        // Promise.withResolvers() is ES2024; this app targets ES2020.
+        await new Promise<void>(resolve => { wake = resolve })
+      }
+    },
+  }
+}
+
+async function* streamChromeAgent(
+  messages: ModelMessage[],
+  system: string | undefined,
+  tools: HarnessTool[],
+  signal?: AbortSignal
+): AsyncGenerator<ChatChunk> {
+  const model = CHROME_MODEL.getModel(PROVIDER_ID, MODEL_ID)
+  if (!model) throw new Error('Chrome Built-in AI model is not registered.')
+
+  const chat = messages.filter(message => message.role === 'user' || message.role === 'assistant')
+  const last = chat[chat.length - 1]
+  if (!last) throw new Error('No user message to send.')
+  const prompt = modelContentText(last.content)
+
+  const queue = createChunkQueue()
+  const toolPaths = new Map<string, string>()
+  let visible = ''
+  let toolCalls = 0
+  let turns = 0
+  let finished = false
+  let cleaned = false
+  let failure: Error | null = null
+
+  const agent = new Agent({
+    initialState: {
+      systemPrompt: system || '',
+      model,
+      tools: tools.map(toAgentTool),
+      messages: toAgentHistory(chat.slice(0, -1)),
+    },
+    streamFn: CHROME_MODEL.streamSimple.bind(CHROME_MODEL),
+    convertToLlm: messages => messages,
+    toolExecution: 'sequential',
+    finishTurn: async () => {
+      turns++
+      return turns >= MAX_AGENT_TURNS ? { action: 'end' as const } : undefined
+    },
+  })
+
+  const unsubscribe = agent.subscribe(event => {
+    if (event.type === 'message_update') {
+      const update = event.assistantMessageEvent
+      if (update.type === 'text_delta') {
+        visible += update.delta
+        queue.push({ text: visible, done: false, delta: update.delta, usage: null })
+      } else if (update.type === 'toolcall_end') {
+        toolCalls++
+        console.log('Tool call:', update.toolCall.name, update.toolCall.arguments)
+      }
+      return
+    }
+    if (event.type === 'tool_execution_start') {
+      const path = toolPathFromArgs(event.args)
+      toolPaths.set(event.toolCallId, path || '')
+      queue.push({
+        text: visible,
+        done: false,
+        delta: '',
+        usage: null,
+        status: `Running ${event.toolName}…`,
+        tool: { name: event.toolName, path },
+      })
+      return
+    }
+    if (event.type === 'tool_execution_end') {
+      const path = toolPaths.get(event.toolCallId)
+      console.log('Tool result:', event.toolName, event.isError ? 'error' : 'ok')
+      queue.push({
+        text: visible,
+        done: false,
+        delta: '',
+        usage: null,
+        tool: { name: event.toolName, path, ok: !event.isError },
+      })
+    }
+  })
+
+  const onAbort = () => agent.abort()
+  signal?.addEventListener('abort', onAbort)
+  const cleanup = () => {
+    if (cleaned) return
+    cleaned = true
+    unsubscribe()
+    signal?.removeEventListener('abort', onAbort)
+  }
+
+  const run = agent.prompt(prompt).catch(error => {
+    failure = error instanceof Error ? error : new Error(String(error))
+  }).finally(() => {
+    finished = true
+    const fallback = toolCalls > 0
+      ? `Completed ${toolCalls} tool call${toolCalls === 1 ? '' : 's'} but the model returned no summary.`
+      : ''
+    queue.push({ text: visible || fallback, done: true, delta: '', usage: null })
+    queue.close()
+    cleanup()
+  })
+  void run
+
+  try {
+    for await (const chunk of queue.drain()) yield chunk
+    if (failure && !signal?.aborted) throw failure
+  } finally {
+    if (!finished) agent.abort()
+    cleanup()
+  }
+}
+
 async function* streamChat(messages: ModelMessage[], system?: string, plainSystem?: string, tools?: HarnessTool[] | Record<string, any>, signal?: AbortSignal): AsyncGenerator<ChatChunk> {
   if (!currentModel) throw new Error('Model not initialized')
   const provider = (currentModel as any).provider || PROVIDERS.WEBLLM
 
   if (provider === PROVIDERS.BROWSER_AI) {
-    let visible = ''
-    let lastToolPath: string | undefined
-    for await (const event of streamChromeHarness({
-      system: system || '',
-      plainSystem: plainSystem || system || '',
-      messages,
-      tools: Array.isArray(tools) ? tools : [],
-      signal,
-    })) {
-      if (signal?.aborted) break
-      if (event.type === 'status') {
-        yield { text: visible, done: false, delta: '', usage: null, status: event.text }
-      } else if (event.type === 'text') {
-        visible = event.text
-        yield { text: event.text, done: false, delta: event.delta, usage: null }
-      } else if (event.type === 'tool-call') {
-        const rawPath = typeof event.args.path === 'string' ? event.args.path : undefined
-        lastToolPath = rawPath?.replace(/\\/g, '/').replace(/^\.?\//, '').replace(/\/+$/, '')
-        console.log('Tool call:', event.name, event.args)
-        yield { text: visible, done: false, delta: '', usage: null, tool: { name: event.name, path: lastToolPath } }
-      } else if (event.type === 'tool-result') {
-        console.log('Tool result:', event.name, event.ok ? 'ok' : 'error', event.preview)
-        yield { text: visible, done: false, delta: '', usage: null, tool: { name: event.name, path: lastToolPath, ok: event.ok } }
-      } else if (event.type === 'fallback') {
-        addNotification(`Chrome tool use unavailable (${event.reason}). Continuing without project tools.`, 'warning')
-      } else if (event.type === 'done') {
-        yield { text: event.text, done: true, delta: '', usage: null }
-        return
-      }
-    }
-    yield { text: '', done: true, delta: '', usage: null }
+    yield* streamChromeAgent(messages, system, Array.isArray(tools) ? tools : [], signal)
     return
   }
 

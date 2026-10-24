@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>pi + Chrome Prompt API</title>
+  <style>
+    :root { color-scheme: dark; }
+    body { margin: 0; padding: 24px; background: #0e1015; color: #e6e6e6; font: 14px/1.5 ui-monospace, monospace; }
+    h1 { font-size: 18px; margin: 0 0 16px; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
+    button { background: #1d2230; color: #e6e6e6; border: 1px solid #333c50; padding: 8px 12px; border-radius: 6px; cursor: pointer; font: inherit; }
+    button:hover { background: #273044; }
+    button:disabled { opacity: .5; cursor: default; }
+    #status { white-space: pre-wrap; margin-bottom: 16px; color: #9fb0c9; }
+    #log { background: #12151d; border: 1px solid #232a38; border-radius: 8px; padding: 12px; min-height: 300px; max-height: 70vh; overflow: auto; white-space: pre-wrap; }
+    .text { color: #d7e6ff; }
+    .tool { color: #ffd479; }
+    .error { color: #ff7b72; }
+    .meta { color: #8b98ab; }
+  </style>
+</head>
+<body>
+  <h1>pi + Chrome Prompt API</h1>
+  <div id="status">Checking LanguageModel…</div>
+  <div class="row">
+    <button id="probe">Probe / download</button>
+    <button id="text">Text turn</button>
+    <button id="tool">Tool turn</button>
+    <button id="clear">Clear log</button>
+  </div>
+  <pre id="log"></pre>
+  <script type="module" src="/pi-test.ts"></script>
+</body>
+</html>

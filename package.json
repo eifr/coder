@@ -11,6 +11,8 @@
     "@browser-ai/core": "^3.0.4",
     "@browser-ai/transformers-js": "^3.0.4",
     "@browser-ai/web-llm": "^3.0.4",
+    "@earendil-works/pi-agent-core": "^1.4.0",
+    "@earendil-works/pi-ai": "^1.4.0",
     "@huggingface/transformers": "^4.3.1",
     "@mlc-ai/web-llm": "^0.2.86",
     "@preact/preset-vite": "^2.10.6",

@@ -1,0 +1,443 @@
+import {
+  createAssistantMessageEventStream,
+  createModels,
+  createProvider,
+  getCurrentSystemPrompt,
+  getCurrentTools,
+  type AssistantMessage,
+  type AssistantMessageEventStream,
+  type JsonObject,
+  type Model,
+  type ProviderStreams,
+  type SimpleStreamOptions,
+  type Tool,
+  type TranscriptContext,
+  type Usage,
+} from '@earendil-works/pi-ai'
+
+const CHROME_API = 'chrome-prompt-api'
+const PROVIDER_ID = 'chrome-ai'
+const MODEL_ID = 'gemini-nano'
+const DEFAULT_CONTEXT_WINDOW = 9216
+
+interface PromptStreamOptions {
+  signal?: AbortSignal
+  responseConstraint?: unknown
+}
+
+interface PromptSession {
+  readonly contextUsage?: number
+  readonly contextWindow?: number
+  promptStreaming(input: unknown, options?: PromptStreamOptions): AsyncIterable<unknown>
+  destroy?: () => void
+}
+
+interface LanguageModelGlobal {
+  availability(options?: Record<string, unknown>): Promise<string>
+  create(options: Record<string, unknown>): Promise<PromptSession>
+}
+
+interface StructuredToolCall {
+  tool: string
+  arguments: JsonObject
+}
+
+interface NativeToolCall {
+  callId?: string
+  callID?: string
+  name: string
+  arguments?: Record<string, unknown>
+}
+
+type TranscriptMessage = TranscriptContext['messages'][number]
+
+function getLanguageModel(): LanguageModelGlobal | undefined {
+  const candidate = (globalThis as Record<string, unknown>).LanguageModel
+  if (candidate === null || (typeof candidate !== 'object' && typeof candidate !== 'function')) return undefined
+  if (!('create' in candidate) || typeof candidate.create !== 'function') return undefined
+  if (!('availability' in candidate) || typeof candidate.availability !== 'function') return undefined
+  return candidate as LanguageModelGlobal
+}
+
+export async function getChromeAvailability(): Promise<{
+  available: boolean
+  availability: string
+}> {
+  const languageModel = getLanguageModel()
+  if (!languageModel) return { available: false, availability: 'missing' }
+  try {
+    const availability = await languageModel.availability()
+    return { available: availability === 'available' || availability === 'downloading', availability }
+  } catch (error) {
+    return { available: false, availability: error instanceof Error ? error.message : String(error) }
+  }
+}
+
+function zeroUsage(): Usage {
+  return {
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: 0,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+  }
+}
+
+function textOf(content: unknown): string {
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return ''
+  return content
+    .map(part => {
+      if (!part || typeof part !== 'object') return ''
+      if ('type' in part && part.type === 'text' && 'text' in part && typeof part.text === 'string') return part.text
+      return ''
+    })
+    .join('')
+}
+
+/** Chrome's Prompt API text chunk: a plain string in older builds, a content object in newer ones. */
+function chunkText(chunk: unknown): string | undefined {
+  if (typeof chunk === 'string') return chunk
+  if (!chunk || typeof chunk !== 'object' || !('type' in chunk) || chunk.type !== 'text') return undefined
+  if ('value' in chunk && typeof chunk.value === 'string') return chunk.value
+  if ('text' in chunk && typeof chunk.text === 'string') return chunk.text
+  return undefined
+}
+
+function isContextOverflow(error: unknown): boolean {
+  if (!(error instanceof Error)) return false
+  return error.name === 'QuotaExceededError' || /context|too large|quota/i.test(error.message)
+}
+
+/**
+ * Native `tool-call` chunks are emitted by builds whose on-device model uses
+ * the Prompt API tool protocol. Current Linux models emit markdown instead, so
+ * the structured fallback below is the default path.
+ */
+function nativeToolCall(chunk: unknown): NativeToolCall | undefined {
+  if (!chunk || typeof chunk !== 'object' || !('type' in chunk) || chunk.type !== 'tool-call') return undefined
+  if (!('value' in chunk) || !chunk.value || typeof chunk.value !== 'object') return undefined
+  const value = chunk.value as Record<string, unknown>
+  if (typeof value.name !== 'string') return undefined
+  const callId = typeof value.callId === 'string' ? value.callId : typeof value.callID === 'string' ? value.callID : undefined
+  if (!callId) return undefined
+  const args = value.arguments && typeof value.arguments === 'object'
+    ? value.arguments as Record<string, unknown>
+    : {}
+  return { callId, name: value.name, arguments: args }
+}
+
+/**
+ * Chrome's on-device model does not emit native `tool-call` content in current
+ * builds, but it does honor `responseConstraint`. Tool calls are therefore
+ * encoded as constrained JSON and translated back into pi tool calls.
+ */
+function toPlainMessage(message: TranscriptMessage): unknown {
+  if (message.role === 'system') {
+    throw new Error('System messages are sent through initialPrompts, not toPlainMessage().')
+  }
+  if (message.role === 'user') return { role: 'user', content: textOf(message.content) }
+  if (message.role === 'assistant') {
+    const text = message.content.map(block => {
+      if (block.type === 'text') return block.text
+      if (block.type === 'toolCall') return `[tool call ${block.name} ${JSON.stringify(block.arguments)}]`
+      return ''
+    }).filter(Boolean).join('\n')
+    return { role: 'assistant', content: text }
+  }
+  return {
+    role: 'user',
+    content: `Tool "${message.toolName}" returned: ${textOf(message.content)}\nThe tool has already run. Do not call it again; answer the user's request with {"text":"..."}.`,
+  }
+}
+
+function buildToolPrompt(system: string, tools: Tool[]): string {
+  const declarations = tools.map(tool => [
+    `- ${tool.name}: ${tool.description}`,
+    `  arguments: ${JSON.stringify(tool.parameters)}`,
+  ].join('\n')).join('\n')
+  return [
+    system,
+    'You can call tools. Reply with exactly one JSON object and no markdown:',
+    '{"tool":"<name>","arguments":{...}} to call a tool, or {"text":"<answer>"} to answer.',
+    'After a tool result, answer with {"text":"<answer>"} and do not call that tool again.',
+    'Omit optional arguments you do not need; never send empty strings or the text "undefined".',
+    'Tools:',
+    declarations,
+  ].filter(Boolean).join('\n')
+}
+
+function buildToolSchema(tools: Tool[]): Record<string, unknown> {
+  return {
+    anyOf: [
+      {
+        type: 'object',
+        properties: { text: { type: 'string' } },
+        required: ['text'],
+      },
+      ...tools.map(tool => ({
+        type: 'object',
+        properties: {
+          tool: { enum: [tool.name] },
+          arguments: tool.parameters,
+        },
+        required: ['tool', 'arguments'],
+      })),
+    ],
+  }
+}
+
+function parseStructuredToolCall(raw: string, tools: Tool[]): StructuredToolCall | undefined {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    return undefined
+  }
+  if (!parsed || typeof parsed !== 'object') return undefined
+  if (!('tool' in parsed) || typeof parsed.tool !== 'string') return undefined
+  if (!tools.some(tool => tool.name === parsed.tool)) return undefined
+  if (!('arguments' in parsed) || !parsed.arguments || typeof parsed.arguments !== 'object') return undefined
+  // responseConstraint validated the arguments against the tool's JSON Schema.
+  return { tool: parsed.tool, arguments: parsed.arguments as JsonObject }
+}
+
+function structuredText(raw: string): string | undefined {
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    if (parsed && typeof parsed === 'object' && 'text' in parsed && typeof parsed.text === 'string') {
+      return parsed.text
+    }
+  } catch {
+    // Fall through to the raw response.
+  }
+  return undefined
+}
+
+async function createSession(
+  languageModel: LanguageModelGlobal,
+  system: string,
+  history: TranscriptMessage[],
+  tools: Tool[],
+  signal: AbortSignal | undefined
+): Promise<PromptSession> {
+  const initialPrompts: unknown[] = []
+  const prompt = tools.length > 0 ? buildToolPrompt(system, tools) : system
+  if (prompt) initialPrompts.push({ role: 'system', content: prompt })
+  initialPrompts.push(...history.map(toPlainMessage))
+
+  const options: Record<string, unknown> = { initialPrompts }
+  if (signal) options.signal = signal
+  return languageModel.create(options)
+}
+
+function newToolCallId(): string {
+  return globalThis.crypto?.randomUUID?.() ?? `tool-${Date.now()}-${Math.random().toString(36).slice(2)}`
+}
+
+function streamSimple(
+  model: Model<typeof CHROME_API>,
+  context: TranscriptContext,
+  options?: SimpleStreamOptions
+): AssistantMessageEventStream {
+  const stream = createAssistantMessageEventStream()
+  const message: AssistantMessage = {
+    role: 'assistant',
+    content: [],
+    api: model.api,
+    provider: model.provider,
+    model: model.id,
+    usage: zeroUsage(),
+    stopReason: 'pending',
+    timestamp: Date.now(),
+  }
+
+  const signal = options?.signal
+
+  void (async () => {
+    const languageModel = getLanguageModel()
+    if (!languageModel) {
+      message.stopReason = 'error'
+      message.errorMessage = 'Chrome Built-in AI (Prompt API) is not available in this browser.'
+      stream.push({ type: 'error', reason: 'error', error: message })
+      stream.end(message)
+      return
+    }
+
+    let session: PromptSession | undefined
+    try {
+      const system = getCurrentSystemPrompt(context.messages)
+      const tools = getCurrentTools(context.messages)
+      const all = context.messages as TranscriptMessage[]
+      const last = all[all.length - 1]
+      if (!last) throw new Error('Chrome provider received an empty transcript.')
+      const history = all.slice(0, -1).filter(item => item.role !== 'system')
+
+      session = await createSession(languageModel, system, history, tools, signal)
+      const inputTokens = session.contextUsage ?? 0
+      const structured = tools.length > 0
+      const promptInput = [toPlainMessage(last)]
+      const promptOptions: PromptStreamOptions = {}
+      if (signal) promptOptions.signal = signal
+      if (structured) promptOptions.responseConstraint = buildToolSchema(tools)
+
+      stream.push({ type: 'start', partial: { ...message } })
+
+      let raw = ''
+      let textIndex = -1
+      let text = ''
+      const nativeCalls: NativeToolCall[] = []
+
+      for await (const chunk of session.promptStreaming(promptInput, promptOptions)) {
+        if (signal?.aborted) break
+        const native = nativeToolCall(chunk)
+        if (native) {
+          nativeCalls.push(native)
+          continue
+        }
+        const delta = chunkText(chunk)
+        if (delta === undefined) continue
+        if (structured) {
+          raw += delta
+          continue
+        }
+        if (textIndex < 0) {
+          textIndex = message.content.length
+          message.content.push({ type: 'text', text: '' })
+          stream.push({ type: 'text_start', contentIndex: textIndex, partial: { ...message } })
+        }
+        text += delta
+        const block = message.content[textIndex]
+        if (block.type === 'text') block.text = text
+        stream.push({ type: 'text_delta', contentIndex: textIndex, delta, partial: { ...message } })
+      }
+
+      if (signal?.aborted) {
+        message.stopReason = 'aborted'
+        message.errorMessage = 'Request aborted.'
+        stream.push({ type: 'error', reason: 'aborted', error: message })
+        stream.end(message)
+        return
+      }
+
+      if (nativeCalls.length > 0) {
+        for (const native of nativeCalls) {
+          const index = message.content.length
+          // Prompt API validates native tool arguments against inputSchema.
+          const args = (native.arguments ?? {}) as JsonObject
+          const call = {
+            type: 'toolCall' as const,
+            id: native.callId ?? newToolCallId(),
+            name: native.name,
+            arguments: args,
+          }
+          message.content.push(call)
+          stream.push({ type: 'toolcall_start', contentIndex: index, partial: { ...message } })
+          stream.push({
+            type: 'toolcall_delta',
+            contentIndex: index,
+            delta: JSON.stringify(call.arguments),
+            partial: { ...message },
+          })
+          stream.push({ type: 'toolcall_end', contentIndex: index, toolCall: call, partial: { ...message } })
+        }
+      } else if (structured) {
+        const toolCall = parseStructuredToolCall(raw, tools)
+        if (toolCall) {
+          const index = message.content.length
+          const call = {
+            type: 'toolCall' as const,
+            id: newToolCallId(),
+            name: toolCall.tool,
+            arguments: toolCall.arguments,
+          }
+          message.content.push(call)
+          stream.push({ type: 'toolcall_start', contentIndex: index, partial: { ...message } })
+          stream.push({
+            type: 'toolcall_delta',
+            contentIndex: index,
+            delta: JSON.stringify(call.arguments),
+            partial: { ...message },
+          })
+          stream.push({ type: 'toolcall_end', contentIndex: index, toolCall: call, partial: { ...message } })
+        } else {
+          const answer = structuredText(raw) ?? raw
+          if (answer) {
+            textIndex = message.content.length
+            message.content.push({ type: 'text', text: answer })
+            stream.push({ type: 'text_start', contentIndex: textIndex, partial: { ...message } })
+            stream.push({ type: 'text_delta', contentIndex: textIndex, delta: answer, partial: { ...message } })
+            stream.push({ type: 'text_end', contentIndex: textIndex, content: answer, partial: { ...message } })
+          }
+        }
+      } else if (textIndex >= 0) {
+        stream.push({ type: 'text_end', contentIndex: textIndex, content: text, partial: { ...message } })
+      }
+
+      const after = session.contextUsage ?? inputTokens
+      const outputTokens = Math.max(0, after - inputTokens)
+      message.usage = {
+        ...zeroUsage(),
+        input: inputTokens,
+        output: outputTokens,
+        totalTokens: inputTokens + outputTokens,
+      }
+      message.stopReason = message.content.some(block => block.type === 'toolCall') ? 'toolUse' : 'stop'
+      stream.push({ type: 'done', reason: message.stopReason, message })
+      stream.end(message)
+    } catch (error) {
+      const aborted = signal?.aborted || (error instanceof Error && error.name === 'AbortError')
+      message.stopReason = aborted ? 'aborted' : 'error'
+      const reason = error instanceof Error ? error.message : String(error)
+      message.errorMessage = isContextOverflow(error) ? `context_length_exceeded: ${reason}` : reason
+      stream.push({ type: 'error', reason: message.stopReason, error: message })
+      stream.end(message)
+    } finally {
+      session?.destroy?.()
+    }
+  })()
+
+  return stream
+}
+
+const chromeStreams: ProviderStreams = {
+  stream: (model, context, options) => streamSimple(
+    model as Model<typeof CHROME_API>,
+    context,
+    options as SimpleStreamOptions
+  ),
+  streamSimple,
+}
+
+export function createChromeModels(contextWindow = DEFAULT_CONTEXT_WINDOW) {
+  const model: Model<typeof CHROME_API> = {
+    id: MODEL_ID,
+    name: 'Chrome Gemini Nano',
+    api: CHROME_API,
+    provider: PROVIDER_ID,
+    baseUrl: 'chrome://built-in-ai',
+    input: ['text'],
+    reasoning: false,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow,
+    maxTokens: 2048,
+  }
+
+  const models = createModels()
+  models.setProvider(createProvider<typeof CHROME_API>({
+    id: PROVIDER_ID,
+    name: 'Chrome Built-in AI',
+    auth: {
+      apiKey: {
+        name: 'Chrome Built-in AI',
+        resolve: async () => ({ auth: {} }),
+      },
+    },
+    models: [model],
+    api: chromeStreams,
+  }))
+  return models
+}
+
+export { CHROME_API, MODEL_ID, PROVIDER_ID }
