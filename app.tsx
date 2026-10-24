@@ -1,5 +1,5 @@
 import { html, render, Component, useState, useEffect, useRef, useCallback, useMemo } from 'htm/preact/standalone.mjs'
-import { PROVIDERS, getAvailableModels, estimateVRAM, getPreferredModel, checkProviderAvailability, getBrowserAIStatus, getBuiltInAICapabilities, getProviderLabel, initProviderModel, type Provider, type ModelDescriptor, type BuiltInApiInfo, type BuiltInApiStatus } from './llm-provider'
+import { PROVIDERS, getAvailableModels, estimateVRAM, getPreferredModel, checkProviderAvailability, getBrowserAIStatus, getBuiltInAICapabilities, initProviderModel, type Provider, type ModelDescriptor, type BuiltInApiInfo, type BuiltInApiStatus } from './llm-provider'
 import { createHarnessTools, type HarnessTool, type HarnessDiagnostic, type HarnessOpenFile, type HarnessSelection } from './chrome-harness'
 import { readRecentCommits, type RecentCommit } from './git-log'
 import { createLocalModels } from './pi-local-provider'
@@ -103,7 +103,6 @@ interface PersistedState {
   selectedModel: string
   customModelUrl: string
   attachContext: boolean
-  modelAreaHidden: boolean
   messages: Message[]
   openFiles: string[]
   selectedFile: string | null
@@ -1274,30 +1273,14 @@ interface SidebarProps {
   onToggleDir: (entry: FileEntry) => void
   onFileClick: (path: string) => void
   selectedFile: string | null
-  modelList: ModelDescriptor[]
-  selectedModel: string
-  onModelChange: (model: string) => void
-  modelLoaded: boolean
-  modelLoading: boolean
-  initProgress: InitProgressState | null
-  onLoadModel: () => void
   onOpenFolder: () => void
-  attachContext: boolean
-  onAttachContextChange: (checked: boolean) => void
-  customModelUrl: string
-  onCustomModel: (url: string) => void
-  selectedProvider: Provider
-  onProviderChange: (provider: Provider) => void
-  modelAreaHidden: boolean
-  onToggleModelArea: () => void
   restorableProject: string | null
   onRestoreProject: () => void
-  onShowBuiltInAI: () => void
   recentCommits: RecentCommit[]
   onRefreshCommits: () => void
 }
 
-function Sidebar({ treeData, indexedCount, expandedPaths, onToggleDir, onFileClick, selectedFile, modelList, selectedModel, onModelChange, modelLoaded, modelLoading, initProgress, onLoadModel, onOpenFolder, attachContext, onAttachContextChange, customModelUrl, onCustomModel, selectedProvider, onProviderChange, modelAreaHidden, onToggleModelArea, restorableProject, onRestoreProject, onShowBuiltInAI, recentCommits, onRefreshCommits }: SidebarProps) {
+function Sidebar({ treeData, indexedCount, expandedPaths, onToggleDir, onFileClick, selectedFile, onOpenFolder, restorableProject, onRestoreProject, recentCommits, onRefreshCommits }: SidebarProps) {
   const visibleCount = useMemo(() => {
     if (!treeData) return 0
     let n = 0
@@ -1305,7 +1288,6 @@ function Sidebar({ treeData, indexedCount, expandedPaths, onToggleDir, onFileCli
     w(treeData)
     return n
   }, [treeData])
-  const modelLabel = modelList.find(m => m.id === selectedModel)?.label || selectedModel
 
   return html`
     <div class="flex flex-col h-full">
@@ -1349,51 +1331,6 @@ function Sidebar({ treeData, indexedCount, expandedPaths, onToggleDir, onFileCli
             </ul>
           </div>
         ` : ''}
-      </div>
-      <div class="p-3 border-t border-line space-y-2.5">
-        <div class="flex items-center justify-between">
-          <span class="text-[10px] font-semibold uppercase tracking-[0.16em] text-faint">Model</span>
-          <button class="text-[10px] text-faint hover:text-ink transition-colors" onClick=${onToggleModelArea} aria-expanded=${!modelAreaHidden}>${modelAreaHidden ? 'Show' : 'Hide'}</button>
-        </div>
-        ${modelAreaHidden ? html`
-          <button class="w-full text-left space-y-0.5" onClick=${onToggleModelArea} aria-label="Show model settings">
-            <span class="block text-[11px] text-muted truncate">${getProviderLabel(selectedProvider)}</span>
-            <span class="block text-[10px] text-faint truncate">${modelLoaded ? (modelLabel === getProviderLabel(selectedProvider) ? 'Loaded' : modelLabel) : 'Not loaded'}</span>
-          </button>
-        ` : html`
-          <label class="block space-y-1">
-            <span class="text-[10px] text-faint">Provider</span>
-            <select class="w-full bg-raised text-ink text-[11.5px] rounded-md px-2.5 py-1.5 border border-line outline-none focus:border-accent/70 disabled:opacity-50" value=${selectedProvider} onChange=${(e: Event) => onProviderChange((e.target as HTMLSelectElement).value as Provider)} disabled=${modelLoading}>
-              ${window.__gpuAvailable ? html`<option value=${PROVIDERS.WEBLLM}>WebLLM</option>` : ''}
-              ${window.__transformersAvailable ? html`<option value=${PROVIDERS.TRANSFORMERS_JS}>Transformers.js</option>` : ''}
-              ${window.__browserAiAvailable ? html`<option value=${PROVIDERS.BROWSER_AI}>Chrome Built-in AI</option>` : html`<option disabled>${window.__browserAiNote || 'Chrome AI (not available)'}</option>`}
-            </select>
-          </label>
-          <button class="w-full flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-md border border-line bg-raised hover:bg-hover text-[10.5px] text-muted hover:text-ink transition-colors" onClick=${onShowBuiltInAI}>
-            <span class="flex items-center gap-1.5"><${SparkIcon} />Built-in AI APIs</span>
-            <span class="text-faint">›</span>
-          </button>
-          <label class="block space-y-1">
-            <span class="text-[10px] text-faint">Model</span>
-            <select class="w-full bg-raised text-ink text-[11.5px] rounded-md px-2.5 py-1.5 border border-line outline-none focus:border-accent/70 disabled:opacity-50" value=${selectedModel} onChange=${(e: Event) => onModelChange((e.target as HTMLSelectElement).value)} disabled=${modelLoading}>
-              ${modelList.filter(m => m.provider === selectedProvider).map(m => html`<option value=${m.id}>${m.label || m.id}${m.vram ? ' · '+m.vram+'MB' : ''}</option>`)}
-            </select>
-          </label>
-          <input type="text" class="w-full bg-raised text-ink text-[11.5px] rounded-md px-2.5 py-1.5 border border-line outline-none focus:border-accent/70 placeholder:text-faint" placeholder="Custom model ID or URL" value=${customModelUrl} onInput=${(e: Event) => onCustomModel((e.target as HTMLInputElement).value)} />
-          ${initProgress ? html`
-            <div class="space-y-1.5">
-              <div class="flex justify-between gap-2 text-[10.5px] text-muted"><span class="line-clamp-3 leading-snug">${initProgress.text}</span><span class="font-mono shrink-0">${Math.round(initProgress.progress * 100)}%</span></div>
-              <div class="h-1 bg-raised rounded-full overflow-hidden"><div class="h-full bg-accent rounded-full transition-all duration-300" style=${{ width: `${initProgress.progress * 100}%` }}></div></div>
-            </div>
-          ` : ''}
-          <button class="w-full px-3 py-1.5 text-[11.5px] rounded-md transition-colors flex items-center justify-center gap-1.5 ${modelLoaded ? 'border border-ok/40 bg-ok/10 text-ok' : modelLoading ? 'bg-raised text-muted border border-line cursor-not-allowed' : 'bg-accent hover:bg-accent-strong text-accent-ink font-medium'}" onClick=${onLoadModel} disabled=${modelLoading}>
-            ${modelLoaded ? html`<${CheckIcon} /><span>Model ready</span>` : modelLoading ? 'Loading…' : 'Load model'}
-          </button>
-          <label class="flex items-start gap-2 text-[11px] text-muted cursor-pointer leading-snug">
-            <input type="checkbox" checked=${attachContext} onChange=${(e: Event) => onAttachContextChange((e.target as HTMLInputElement).checked)} class="accent-accent mt-0.5" />
-            <span>Attach project context</span>
-          </label>
-        `}
       </div>
     </div>
   `
@@ -1493,14 +1430,35 @@ interface ChatPanelProps {
   onClear: () => void
   onExport: () => void
   modelLoaded: boolean
+  modelList: ModelDescriptor[]
+  selectedModel: string
+  onModelChange: (model: string) => void
+  modelLoading: boolean
+  initProgress: InitProgressState | null
+  onLoadModel: () => void
+  attachContext: boolean
+  onAttachContextChange: (checked: boolean) => void
+  customModelUrl: string
+  onCustomModel: (url: string) => void
+  selectedProvider: Provider
+  onProviderChange: (provider: Provider) => void
+  onShowBuiltInAI: () => void
   draft: string
   onDraftConsumed: () => void
 }
 
-function ChatPanel({ messages, streamingContent, codeBlocks, isGenerating, generationStatus, onSend, onStop, onApply, onClear, onExport, modelLoaded, draft, onDraftConsumed }: ChatPanelProps) {
+function ChatPanel({ messages, streamingContent, codeBlocks, isGenerating, generationStatus, onSend, onStop, onApply, onClear, onExport, modelLoaded, modelList, selectedModel, onModelChange, modelLoading, initProgress, onLoadModel, attachContext, onAttachContextChange, customModelUrl, onCustomModel, selectedProvider, onProviderChange, onShowBuiltInAI, draft, onDraftConsumed }: ChatPanelProps) {
   const endRef = useRef<HTMLDivElement | null>(null)
   const [input, setInput] = useState('')
   const [confirmClear, setConfirmClear] = useState(false)
+  const [tab, setTab] = useState<'chat' | 'model'>(modelLoaded ? 'chat' : 'model')
+  const prevLoaded = useRef(modelLoaded)
+
+  useEffect(() => {
+    if (modelLoaded && !prevLoaded.current) setTab('chat')
+    else if (!modelLoaded && prevLoaded.current) setTab('model')
+    prevLoaded.current = modelLoaded
+  }, [modelLoaded])
 
   useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages, streamingContent, codeBlocks])
 
@@ -1537,56 +1495,114 @@ function ChatPanel({ messages, streamingContent, codeBlocks, isGenerating, gener
 
   return html`
     <div class="flex flex-col h-full">
-      <div class="h-10 border-b border-line flex items-center gap-3 px-3 shrink-0">
-        <span class="text-[10px] font-semibold uppercase tracking-[0.16em] text-faint">Chat</span>
+      <div class="h-10 border-b border-line flex items-center gap-1 px-2 shrink-0">
+        <button
+          class="px-2.5 py-1 rounded-md text-[11px] transition-colors ${tab === 'chat' ? 'bg-raised text-ink' : 'text-muted hover:text-ink'}"
+          aria-pressed=${tab === 'chat'}
+          onClick=${() => setTab('chat')}
+        >Chat</button>
+        <button
+          class="px-2.5 py-1 rounded-md text-[11px] transition-colors flex items-center gap-1.5 ${tab === 'model' ? 'bg-raised text-ink' : 'text-muted hover:text-ink'}"
+          aria-pressed=${tab === 'model'}
+          onClick=${() => setTab('model')}
+        >Model${!modelLoaded ? html`<span class="w-1.5 h-1.5 rounded-full bg-accent"></span>` : ''}</button>
         <div class="ml-auto flex items-center gap-2.5 text-[10.5px]">
-          <button class="text-faint hover:text-ink transition-colors disabled:opacity-40 disabled:hover:text-faint" onClick=${onExport} disabled=${messages.length === 0}>Export</button>
-          <button
-            class="transition-colors ${confirmClear ? 'text-accent font-medium' : 'text-faint hover:text-ink'}"
-            onClick=${() => { if (confirmClear) { onClear(); setConfirmClear(false) } else setConfirmClear(true) }}
-          >${confirmClear ? 'Confirm clear' : 'Clear'}</button>
+          ${tab === 'chat' ? html`
+            <button class="text-faint hover:text-ink transition-colors disabled:opacity-40 disabled:hover:text-faint" onClick=${onExport} disabled=${messages.length === 0}>Export</button>
+            <button
+              class="transition-colors ${confirmClear ? 'text-accent font-medium' : 'text-faint hover:text-ink'}"
+              onClick=${() => { if (confirmClear) { onClear(); setConfirmClear(false) } else setConfirmClear(true) }}
+            >${confirmClear ? 'Confirm clear' : 'Clear'}</button>
+          ` : html`<span class="text-faint">${modelLoaded ? 'Ready' : modelLoading ? 'Loading' : 'Not loaded'}</span>`}
         </div>
       </div>
-      <div class="flex-1 overflow-y-auto p-3 space-y-4">
-        ${all.length===0 ? html`
-          <div class="h-full flex flex-col items-center justify-center text-center px-4">
-            <${Logo} class="w-10 h-10 mb-4" />
-            <p class="text-[12.5px] font-medium text-ink">${modelLoaded ? 'Ask about your code' : 'No model loaded'}</p>
-            <p class="mt-1.5 text-[11px] leading-relaxed text-muted max-w-[240px]">${modelLoaded
-              ? 'The assistant reads and edits your project only when context is attached.'
-              : 'Load a model from the sidebar to start. Everything runs on this device.'}</p>
-            ${modelLoaded ? html`
-              <div class="mt-4 flex flex-wrap justify-center gap-1.5">
-                ${['Explain the open file', 'Find bugs in this project', 'Write a test'].map(prompt => html`
-                  <button key=${prompt} class="px-2.5 py-1 rounded-full border border-line bg-raised text-[10.5px] text-muted hover:text-ink hover:border-line-strong transition-colors" onClick=${() => onSend(prompt)}>${prompt}</button>
-                `)}
-              </div>` : ''}
-          </div>
-        ` : all.map((m: Message, i: number) => html`<${MessageBubble} key=${i} msg=${m} onApply=${onApply} appliedBlocks=${codeBlocks} />`)}
-        ${isGenerating && !streamingContent ? html`<div class="flex items-center gap-2 px-1 py-1"><div class="flex items-center gap-1 text-accent"><span class="dot-pulse">●</span><span class="dot-pulse">●</span><span class="dot-pulse">●</span></div><span class="text-[10.5px] text-muted">${generationStatus || 'Working on-device…'}</span></div>` : ''}
-        <div ref=${endRef} />
-      </div>
-      <div class="p-3 border-t border-line space-y-2">
-        ${codeBlocks.filter(b => !b.applied).length > 0 ? html`
-          <div class="space-y-1 max-h-24 overflow-y-auto">
-            ${codeBlocks.filter(b => !b.applied).map((b, i) => html`
-              <div key=${i} class="flex items-center justify-between gap-2 bg-raised rounded-md px-2.5 py-1.5 border border-line">
-                <span class="font-mono text-[10px] text-muted truncate">${b.path || b.lang}</span>
-                <button class="text-[10px] px-2 py-0.5 bg-accent hover:bg-accent-strong text-accent-ink font-medium rounded shrink-0" onClick=${() => onApply(b.path, b.code)}>Apply</button>
-              </div>
-            `)}
-          </div>
-        ` : ''}
-        <div class="flex gap-2 items-end">
-          <textarea class="flex-1 bg-raised text-ink text-[12px] leading-relaxed rounded-lg px-3 py-2 border border-line outline-none focus:border-accent/70 resize-none placeholder:text-faint disabled:opacity-60" rows=${2} placeholder=${modelLoaded?"Ask about your code…":"Load a model first…"} value=${input} onInput=${(e: Event)=>setInput((e.target as HTMLTextAreaElement).value)} onKeyDown=${kd} disabled=${!modelLoaded}></textarea>
-          <div class="flex flex-col gap-1">
-            <button class="px-3 py-1.5 text-[11.5px] rounded-lg transition-colors ${modelLoaded&&!isGenerating?'bg-accent hover:bg-accent-strong text-accent-ink font-medium':'bg-raised text-faint border border-line cursor-not-allowed'}" onClick=${send} disabled=${!modelLoaded||isGenerating}>Send</button>
-            ${isGenerating ? html`<button class="px-3 py-1.5 text-[11.5px] rounded-lg border border-danger/40 text-danger hover:bg-danger/10 transition-colors" onClick=${onStop}>Stop</button>` : ''}
+      ${tab === 'chat' ? html`
+        <div class="flex-1 overflow-y-auto p-3 space-y-4">
+          ${all.length===0 ? html`
+            <div class="h-full flex flex-col items-center justify-center text-center px-4">
+              <${Logo} class="w-10 h-10 mb-4" />
+              <p class="text-[12.5px] font-medium text-ink">${modelLoaded ? 'Ask about your code' : 'No model loaded'}</p>
+              <p class="mt-1.5 text-[11px] leading-relaxed text-muted max-w-[240px]">${modelLoaded
+                ? 'The assistant reads and edits your project only when context is attached.'
+                : 'Choose a model in the Model tab to start. Everything runs on this device.'}</p>
+              ${modelLoaded ? html`
+                <div class="mt-4 flex flex-wrap justify-center gap-1.5">
+                  ${['Explain the open file', 'Find bugs in this project', 'Write a test'].map(prompt => html`
+                    <button key=${prompt} class="px-2.5 py-1 rounded-full border border-line bg-raised text-[10.5px] text-muted hover:text-ink hover:border-line-strong transition-colors" onClick=${() => onSend(prompt)}>${prompt}</button>
+                  `)}
+                </div>` : html`
+                <button class="mt-4 px-3 py-1.5 bg-accent hover:bg-accent-strong text-accent-ink text-[11.5px] font-medium rounded-md transition-colors" onClick=${() => setTab('model')}>Choose a model</button>`}
+            </div>
+          ` : all.map((m: Message, i: number) => html`<${MessageBubble} key=${i} msg=${m} onApply=${onApply} appliedBlocks=${codeBlocks} />`)}
+          ${isGenerating && !streamingContent ? html`<div class="flex items-center gap-2 px-1 py-1"><div class="flex items-center gap-1 text-accent"><span class="dot-pulse">●</span><span class="dot-pulse">●</span><span class="dot-pulse">●</span></div><span class="text-[10.5px] text-muted">${generationStatus || 'Working on-device…'}</span></div>` : ''}
+          <div ref=${endRef} />
+        </div>
+        <div class="p-3 border-t border-line space-y-2">
+          ${codeBlocks.filter(b => !b.applied).length > 0 ? html`
+            <div class="space-y-1 max-h-24 overflow-y-auto">
+              ${codeBlocks.filter(b => !b.applied).map((b, i) => html`
+                <div key=${i} class="flex items-center justify-between gap-2 bg-raised rounded-md px-2.5 py-1.5 border border-line">
+                  <span class="font-mono text-[10px] text-muted truncate">${b.path || b.lang}</span>
+                  <button class="text-[10px] px-2 py-0.5 bg-accent hover:bg-accent-strong text-accent-ink font-medium rounded shrink-0" onClick=${() => onApply(b.path, b.code)}>Apply</button>
+                </div>
+              `)}
+            </div>
+          ` : ''}
+          <div class="flex gap-2 items-end">
+            <textarea class="flex-1 bg-raised text-ink text-[12px] leading-relaxed rounded-lg px-3 py-2 border border-line outline-none focus:border-accent/70 resize-none placeholder:text-faint disabled:opacity-60" rows=${2} placeholder=${modelLoaded?"Ask about your code…":"Load a model first…"} value=${input} onInput=${(e: Event)=>setInput((e.target as HTMLTextAreaElement).value)} onKeyDown=${kd} disabled=${!modelLoaded}></textarea>
+            <div class="flex flex-col gap-1">
+              <button class="px-3 py-1.5 text-[11.5px] rounded-lg transition-colors ${modelLoaded&&!isGenerating?'bg-accent hover:bg-accent-strong text-accent-ink font-medium':'bg-raised text-faint border border-line cursor-not-allowed'}" onClick=${send} disabled=${!modelLoaded||isGenerating}>Send</button>
+              ${isGenerating ? html`<button class="px-3 py-1.5 text-[11.5px] rounded-lg border border-danger/40 text-danger hover:bg-danger/10 transition-colors" onClick=${onStop}>Stop</button>` : ''}
+            </div>
           </div>
         </div>
-      </div>
+      ` : html`
+        <div class="flex-1 overflow-y-auto p-3 space-y-3">
+          <div>
+            <p class="text-[12.5px] font-medium text-ink">Model</p>
+            <p class="mt-1 text-[10.5px] leading-relaxed text-muted">Choose a model that runs locally in this browser. Chrome Built-in AI downloads its model once; the other providers download the selected weights.</p>
+          </div>
+          <label class="block space-y-1">
+            <span class="text-[10px] text-faint">Provider</span>
+            <select class="w-full bg-raised text-ink text-[11.5px] rounded-md px-2.5 py-1.5 border border-line outline-none focus:border-accent/70 disabled:opacity-50" value=${selectedProvider} onChange=${(e: Event) => onProviderChange((e.target as HTMLSelectElement).value as Provider)} disabled=${modelLoading}>
+              ${window.__gpuAvailable ? html`<option value=${PROVIDERS.WEBLLM}>WebLLM</option>` : ''}
+              ${window.__transformersAvailable ? html`<option value=${PROVIDERS.TRANSFORMERS_JS}>Transformers.js</option>` : ''}
+              ${window.__browserAiAvailable ? html`<option value=${PROVIDERS.BROWSER_AI}>Chrome Built-in AI</option>` : html`<option disabled>${window.__browserAiNote || 'Chrome AI (not available)'}</option>`}
+            </select>
+          </label>
+          <button class="w-full flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-md border border-line bg-raised hover:bg-hover text-[10.5px] text-muted hover:text-ink transition-colors" onClick=${onShowBuiltInAI}>
+            <span class="flex items-center gap-1.5"><${SparkIcon} />Built-in AI APIs</span>
+            <span class="text-faint">›</span>
+          </button>
+          <label class="block space-y-1">
+            <span class="text-[10px] text-faint">Model</span>
+            <select class="w-full bg-raised text-ink text-[11.5px] rounded-md px-2.5 py-1.5 border border-line outline-none focus:border-accent/70 disabled:opacity-50" value=${selectedModel} onChange=${(e: Event) => onModelChange((e.target as HTMLSelectElement).value)} disabled=${modelLoading}>
+              ${modelList.filter(m => m.provider === selectedProvider).length === 0
+                ? html`<option value="">No models available</option>`
+                : modelList.filter(m => m.provider === selectedProvider).map(m => html`<option value=${m.id}>${m.label || m.id}${m.vram ? ' · '+m.vram+'MB' : ''}</option>`)}
+            </select>
+          </label>
+          <input type="text" class="w-full bg-raised text-ink text-[11.5px] rounded-md px-2.5 py-1.5 border border-line outline-none focus:border-accent/70 placeholder:text-faint" placeholder="Custom model ID or URL" value=${customModelUrl} onInput=${(e: Event) => onCustomModel((e.target as HTMLInputElement).value)} />
+          ${initProgress ? html`
+            <div class="space-y-1.5">
+              <div class="flex justify-between gap-2 text-[10.5px] text-muted"><span class="line-clamp-3 leading-snug">${initProgress.text}</span><span class="font-mono shrink-0">${Math.round(initProgress.progress * 100)}%</span></div>
+              <div class="h-1 bg-raised rounded-full overflow-hidden"><div class="h-full bg-accent rounded-full transition-all duration-300" style=${{ width: `${initProgress.progress * 100}%` }}></div></div>
+            </div>
+          ` : ''}
+          <button class="w-full px-3 py-1.5 text-[11.5px] rounded-md transition-colors flex items-center justify-center gap-1.5 ${modelLoaded ? 'border border-ok/40 bg-ok/10 text-ok' : modelLoading ? 'bg-raised text-muted border border-line cursor-not-allowed' : 'bg-accent hover:bg-accent-strong text-accent-ink font-medium'}" onClick=${onLoadModel} disabled=${modelLoading}>
+            ${modelLoaded ? html`<${CheckIcon} /><span>Model ready</span>` : modelLoading ? 'Loading…' : 'Load model'}
+          </button>
+          ${modelLoaded ? html`<button class="w-full px-3 py-1.5 text-[11.5px] rounded-md border border-line bg-raised hover:bg-hover text-muted hover:text-ink transition-colors" onClick=${() => setTab('chat')}>Open chat</button>` : ''}
+          <label class="flex items-start gap-2 text-[11px] text-muted cursor-pointer leading-snug">
+            <input type="checkbox" checked=${attachContext} onChange=${(e: Event) => onAttachContextChange((e.target as HTMLInputElement).checked)} class="accent-accent mt-0.5" />
+            <span>Attach project context</span>
+          </label>
+          <p class="text-[10px] text-faint leading-relaxed">With context attached, the assistant can read and edit files with tools. Models stay on this device.</p>
+        </div>
+      `}
     </div>
   `
+
 }
 
 const IS_MAC = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent)
@@ -2196,7 +2212,6 @@ function App() {
   const [generationStatus, setGenerationStatus] = useState('')
   const [codeBlocks, setCodeBlocks] = useState<CodeBlock[]>([])
   const [attachContext, setAttachContext] = useState(saved.attachContext ?? true)
-  const [modelAreaHidden, setModelAreaHidden] = useState(saved.modelAreaHidden ?? false)
   const [customModelUrl, setCustomModelUrl] = useState(saved.customModelUrl || '')
   const [savedFile, setSavedFile] = useState('')
   const [mobilePanel, setMobilePanel] = useState<'files' | 'chat' | null>(null)
@@ -2278,8 +2293,8 @@ function App() {
   }, [builtInTask])
 
   useEffect(() => {
-    saveState({ selectedProvider, selectedModel, customModelUrl, attachContext, modelAreaHidden, messages })
-  }, [selectedProvider, selectedModel, customModelUrl, attachContext, modelAreaHidden, messages])
+    saveState({ selectedProvider, selectedModel, customModelUrl, attachContext, messages })
+  }, [selectedProvider, selectedModel, customModelUrl, attachContext, messages])
 
   // Open tabs only make sense with a project loaded; saving them earlier would
   // overwrite the snapshot before the restore effect gets to read it.
@@ -2743,9 +2758,24 @@ function App() {
     } finally { setModelLoading(false) }
   }, [selectedModel, selectedProvider, customModelUrl])
 
-  const sidebarProps: SidebarProps = { treeData, indexedCount, expandedPaths, onToggleDir: handleToggleDir, onFileClick: handleFileClick, selectedFile, modelList, selectedModel, onModelChange: m => { setSelectedModel(m); setModelLoaded(false) }, modelLoaded, modelLoading, initProgress, onLoadModel: handleLoadModel, onOpenFolder: handleOpenFolder, attachContext, onAttachContextChange: setAttachContext, customModelUrl, onCustomModel: setCustomModelUrl, selectedProvider, onProviderChange: p => { if (p === PROVIDERS.BROWSER_AI && !window.__browserAiAvailable) return; setSelectedProvider(p); setSelectedModel(''); setModelLoaded(false); const models = getAvailableModels(4096); const first = models.find(m => m.provider === p); if (first) setSelectedModel(first.id) }, modelAreaHidden, onToggleModelArea: () => setModelAreaHidden(v => !v), restorableProject, onRestoreProject: handleRestoreProject, onShowBuiltInAI: () => setShowBuiltInAI(true), recentCommits, onRefreshCommits: handleRefreshCommits }
+  const handleProviderChange = useCallback((p: Provider) => {
+    if (p === PROVIDERS.BROWSER_AI && !window.__browserAiAvailable) return
+    setSelectedProvider(p)
+    setSelectedModel('')
+    setModelLoaded(false)
+    const models = getAvailableModels(4096)
+    const first = models.find(m => m.provider === p)
+    if (first) setSelectedModel(first.id)
+  }, [])
 
-  const chatProps: ChatPanelProps = { messages, streamingContent, codeBlocks, isGenerating, generationStatus, onSend: handleSend, onStop: handleStop, onApply: handleApply, onClear: handleClear, onExport: handleExportChat, modelLoaded, draft: chatDraft, onDraftConsumed: consumeChatDraft }
+  const handleModelChange = useCallback((m: string) => {
+    setSelectedModel(m)
+    setModelLoaded(false)
+  }, [])
+
+  const sidebarProps: SidebarProps = { treeData, indexedCount, expandedPaths, onToggleDir: handleToggleDir, onFileClick: handleFileClick, selectedFile, onOpenFolder: handleOpenFolder, restorableProject, onRestoreProject: handleRestoreProject, recentCommits, onRefreshCommits: handleRefreshCommits }
+
+  const chatProps: ChatPanelProps = { messages, streamingContent, codeBlocks, isGenerating, generationStatus, onSend: handleSend, onStop: handleStop, onApply: handleApply, onClear: handleClear, onExport: handleExportChat, modelLoaded, modelList, selectedModel, onModelChange: handleModelChange, modelLoading, initProgress, onLoadModel: handleLoadModel, attachContext, onAttachContextChange: setAttachContext, customModelUrl, onCustomModel: setCustomModelUrl, selectedProvider, onProviderChange: handleProviderChange, onShowBuiltInAI: () => setShowBuiltInAI(true), draft: chatDraft, onDraftConsumed: consumeChatDraft }
   const quickFiles = useMemo(() => quickOpen ? [...fileHandles.keys()].sort() : [], [quickOpen, indexedCount])
   const modelLabel = modelList.find(m => m.id === selectedModel)?.label || selectedModel
 
