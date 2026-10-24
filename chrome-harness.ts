@@ -487,6 +487,35 @@ export function createHarnessTools(fs: HarnessFs): HarnessTool[] {
     if (!prefix) return all
     return all.filter(path => path === prefix || path.startsWith(`${prefix}/`))
   }
+  /**
+   * A small model often turns `useThings.ts` into `use/things/ts`. Name the
+   * closest real files so the next attempt can succeed instead of repeating
+   * the miss.
+   */
+  const notFound = async (path: string): Promise<{ error: string }> => {
+    const needle = path.toLowerCase()
+    const squashed = needle.replace(/[/.]/g, '')
+    const base = needle.split('/').pop() ?? needle
+    const scored = (await fs.listFiles())
+      .map(file => {
+        const lower = file.toLowerCase()
+        const fileSquashed = lower.replace(/[/.]/g, '')
+        const score = fileSquashed === squashed
+          ? 3
+          : lower.endsWith(base) && base.length > 2
+            ? 2
+            : fileSquashed.includes(squashed) || squashed.includes(fileSquashed)
+              ? 1
+              : 0
+        return { file, score }
+      })
+      .filter(item => item.score > 0)
+      .sort((a, b) => b.score - a.score || a.file.length - b.file.length)
+      .slice(0, 3)
+      .map(item => item.file)
+    const hint = scored.length > 0 ? ` Did you mean: ${scored.join(', ')}?` : ' Use listFiles to see the real paths.'
+    return { error: `File not found: ${path}.${hint}` }
+  }
 
   return [
     {
@@ -606,7 +635,7 @@ export function createHarnessTools(fs: HarnessFs): HarnessTool[] {
         if ('error' in check) return { error: check.error }
         const file = check.path
         const content = await fs.readFile(file)
-        if (content == null) return { error: `File not found: ${file}` }
+        if (content == null) return notFound(file)
         clearedForEdit.add(file)
         const lines = content.split('\n')
         const totalLines = lines.length
@@ -738,7 +767,7 @@ export function createHarnessTools(fs: HarnessFs): HarnessTool[] {
         const guard = ensureRead(from.path)
         if (guard) return { error: guard }
         const content = await fs.readFile(from.path)
-        if (content == null) return { error: `File not found: ${from.path}` }
+        if (content == null) return notFound(from.path)
         if (content.length > MAX_WRITE_CHARS) return { error: `Refusing to move ${content.length} characters (limit ${MAX_WRITE_CHARS}).` }
         const created = await fs.createFile(to.path, content)
         if (!created) return { error: `Failed to create ${to.path} (it may already exist)` }
@@ -769,7 +798,7 @@ export function createHarnessTools(fs: HarnessFs): HarnessTool[] {
         const guard = ensureRead(from.path)
         if (guard) return { error: guard }
         const content = await fs.readFile(from.path)
-        if (content == null) return { error: `File not found: ${from.path}` }
+        if (content == null) return notFound(from.path)
         if (content.length > MAX_WRITE_CHARS) return { error: `Refusing to copy ${content.length} characters (limit ${MAX_WRITE_CHARS}).` }
         const created = await fs.createFile(to.path, content)
         if (!created) return { error: `Failed to create ${to.path} (it may already exist)` }
@@ -799,7 +828,7 @@ export function createHarnessTools(fs: HarnessFs): HarnessTool[] {
         const needle = String(oldText ?? '')
         if (!needle) return { error: 'oldText is required' }
         const content = await fs.readFile(file)
-        if (content == null) return { error: `File not found: ${file}` }
+        if (content == null) return notFound(file)
         const replacement = String(newText ?? '')
         const count = content.split(needle).length - 1
         if (count === 0) return { error: `oldText was not found in ${file}` }
@@ -857,7 +886,7 @@ export function createHarnessTools(fs: HarnessFs): HarnessTool[] {
           let content = working.get(file)
           if (content === undefined) {
             const read = await fs.readFile(file)
-            if (read == null) return { error: `File not found: ${file}` }
+            if (read == null) return notFound(file)
             content = read
           }
           const replacement = String(edit.newText ?? '')
@@ -910,7 +939,7 @@ export function createHarnessTools(fs: HarnessFs): HarnessTool[] {
         if (body.length > MAX_WRITE_CHARS) {
           return { error: `Refusing to write ${body.length} characters (limit ${MAX_WRITE_CHARS}). Split the change into smaller edits.` }
         }
-        if (await fs.readFile(file) == null) return { error: `File not found: ${file}. Use createFile for new files.` }
+        if (await fs.readFile(file) == null) return notFound(file)
         const ok = await fs.writeFile(file, body)
         return ok ? { path: file, written: true } : { error: `Failed to write ${file}` }
       },

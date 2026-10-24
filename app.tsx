@@ -98,7 +98,7 @@ declare global {
 
 const STORAGE_KEY = 'coder-state'
 // Bump this when debugging a stale PWA/dev bundle; shown in the Model tab.
-const APP_BUILD = 'offline-session-8'
+const APP_BUILD = 'offline-session-9'
 
 interface PersistedState {
   selectedProvider: Provider
@@ -1340,15 +1340,21 @@ function addFileToTree(entries: FileEntry[] | null, path: string, entry: FileEnt
   return walk(entries, 0)
 }
 
-function buildFileTree(treeData: FileEntry[]): string {
+/** File paths sent to the model; the rest are reachable with listFiles. */
+const MAX_TREE_PATHS = 800
+
+/**
+ * Flat list of exact relative paths from the index: the tools take those paths
+ * verbatim, and an indented name tree made small models rebuild `dir/file`
+ * (and split names like `app.dataTransfer.js` into `app/dataTransfer.js`).
+ */
+function buildFileTree(): string {
+  const paths = [...fileHandles.keys()].sort()
   const lines = [`Project: ${rootDirName}`, '']
-  function flat(entries: FileEntry[], p = '') {
-    for (const e of entries) {
-      if (e.type === 'dir') { lines.push(`${p}${e.name}/`); if (e.children) flat(e.children, p + '  ') }
-      else lines.push(`${p}${e.name}`)
-    }
+  lines.push(...paths.slice(0, MAX_TREE_PATHS))
+  if (paths.length > MAX_TREE_PATHS) {
+    lines.push(`…[${paths.length - MAX_TREE_PATHS} more files; use listFiles to see them]`)
   }
-  flat(treeData)
   return lines.join('\n')
 }
 
@@ -2899,8 +2905,10 @@ function App() {
     // Pure greetings should not pay for a 15-tool structured session.
     const conversational = text !== null && text.trim().length < 80 && /^(hi|hello|hey|thanks|thank you|ok|okay|sure|yes|no|who are you|what can you do|how are you)\b[!.?\s]*$/i.test(text.trim())
     const useContext = attachContext && !!treeData && !conversational
-    const fileTree = useContext && treeData ? buildFileTree(treeData) : null
-    let plainSystem = fileTree ? `${SYSTEM_PROMPT}\n\nProject file tree:\n${fileTree}` : SYSTEM_PROMPT
+    // The prompt lists indexed file paths, so wait for the index the tools use.
+    if (useContext) await ensureIndexed()
+    const fileTree = useContext ? buildFileTree() : null
+    let plainSystem = fileTree ? `${SYSTEM_PROMPT}\n\nProject files (exact relative paths):\n${fileTree}` : SYSTEM_PROMPT
 
     let tools: HarnessTool[] | undefined
     if (useContext) {
@@ -2933,7 +2941,7 @@ function App() {
     }
 
     const systemMsg = useContext
-      ? (fileTree ? `${TOOL_SYSTEM_PROMPT}\n\nProject file tree:\n${fileTree}${openFileBlock}` : `${TOOL_SYSTEM_PROMPT}${openFileBlock}`)
+      ? (fileTree ? `${TOOL_SYSTEM_PROMPT}\n\nProject files (exact relative paths):\n${fileTree}${openFileBlock}` : `${TOOL_SYSTEM_PROMPT}${openFileBlock}`)
       : plainSystem
 
     // Read on every turn so edits to the instructions apply immediately.
