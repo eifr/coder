@@ -98,7 +98,7 @@ declare global {
 
 const STORAGE_KEY = 'coder-state'
 // Bump this when debugging a stale PWA/dev bundle; shown in the Model tab.
-const APP_BUILD = 'chrome-fallback-4'
+const APP_BUILD = 'chrome-fallback-5'
 
 interface PersistedState {
   selectedProvider: Provider
@@ -259,6 +259,7 @@ Rules:
 const TOOL_SYSTEM_PROMPT = `${SYSTEM_PROMPT}
 
 You can inspect and modify the user's local project with tools:
+If the user asks about a project file, use findFiles/listFiles and readFile. Never say you lack access while these tools are available.
 - listFiles / searchFiles: find files and symbols
 - findFiles: find files by glob pattern, e.g. src/**/*.ts
 - readFile: read a file (required before any edit)
@@ -1450,11 +1451,12 @@ interface ChatPanelProps {
   selectedProvider: Provider
   onProviderChange: (provider: Provider) => void
   onShowBuiltInAI: () => void
+  projectOpen: boolean
   draft: string
   onDraftConsumed: () => void
 }
 
-function ChatPanel({ messages, streamingContent, codeBlocks, isGenerating, generationStatus, onSend, onStop, onApply, onClear, onExport, modelLoaded, modelList, selectedModel, onModelChange, modelLoading, initProgress, onLoadModel, attachContext, onAttachContextChange, customModelUrl, onCustomModel, selectedProvider, onProviderChange, onShowBuiltInAI, draft, onDraftConsumed }: ChatPanelProps) {
+function ChatPanel({ messages, streamingContent, codeBlocks, isGenerating, generationStatus, onSend, onStop, onApply, onClear, onExport, modelLoaded, modelList, selectedModel, onModelChange, modelLoading, initProgress, onLoadModel, attachContext, onAttachContextChange, customModelUrl, onCustomModel, selectedProvider, onProviderChange, onShowBuiltInAI, projectOpen, draft, onDraftConsumed }: ChatPanelProps) {
   const endRef = useRef<HTMLDivElement | null>(null)
   const [input, setInput] = useState('')
   const [confirmClear, setConfirmClear] = useState(false)
@@ -1524,6 +1526,14 @@ function ChatPanel({ messages, streamingContent, codeBlocks, isGenerating, gener
         </div>
       </div>
       ${tab === 'chat' ? html`
+        ${projectOpen ? (attachContext ? html`
+          <div class="px-3 py-1 border-b border-line text-[9.5px] text-faint">Project context on · file tools available</div>
+        ` : html`
+          <div class="px-3 py-2 border-b border-line flex items-center justify-between gap-2 text-[10.5px]">
+            <span class="text-accent">Project context is off — the assistant cannot read project files.</span>
+            <button class="px-2 py-0.5 rounded bg-accent hover:bg-accent-strong text-accent-ink text-[10px] font-medium shrink-0" onClick=${() => onAttachContextChange(true)}>Enable</button>
+          </div>
+        `) : ''}
         <div class="flex-1 overflow-y-auto p-3 space-y-4">
           ${all.length===0 ? html`
             <div class="h-full flex flex-col items-center justify-center text-center px-4">
@@ -2786,7 +2796,7 @@ function App() {
 
   const sidebarProps: SidebarProps = { treeData, indexedCount, expandedPaths, onToggleDir: handleToggleDir, onFileClick: handleFileClick, selectedFile, onOpenFolder: handleOpenFolder, restorableProject, onRestoreProject: handleRestoreProject, recentCommits, onRefreshCommits: handleRefreshCommits }
 
-  const chatProps: ChatPanelProps = { messages, streamingContent, codeBlocks, isGenerating, generationStatus, onSend: handleSend, onStop: handleStop, onApply: handleApply, onClear: handleClear, onExport: handleExportChat, modelLoaded, modelList, selectedModel, onModelChange: handleModelChange, modelLoading, initProgress, onLoadModel: handleLoadModel, attachContext, onAttachContextChange: setAttachContext, customModelUrl, onCustomModel: setCustomModelUrl, selectedProvider, onProviderChange: handleProviderChange, onShowBuiltInAI: () => setShowBuiltInAI(true), draft: chatDraft, onDraftConsumed: consumeChatDraft }
+  const chatProps: ChatPanelProps = { messages, streamingContent, codeBlocks, isGenerating, generationStatus, onSend: handleSend, onStop: handleStop, onApply: handleApply, onClear: handleClear, onExport: handleExportChat, modelLoaded, modelList, selectedModel, onModelChange: handleModelChange, modelLoading, initProgress, onLoadModel: handleLoadModel, attachContext, onAttachContextChange: setAttachContext, customModelUrl, onCustomModel: setCustomModelUrl, selectedProvider, onProviderChange: handleProviderChange, onShowBuiltInAI: () => setShowBuiltInAI(true), projectOpen: !!treeData, draft: chatDraft, onDraftConsumed: consumeChatDraft }
   const quickFiles = useMemo(() => quickOpen ? [...fileHandles.keys()].sort() : [], [quickOpen, indexedCount])
   const modelLabel = modelList.find(m => m.id === selectedModel)?.label || selectedModel
 
