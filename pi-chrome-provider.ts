@@ -264,10 +264,17 @@ async function createSession(
 ): Promise<PromptSession> {
   const initialPrompts: unknown[] = []
   const prompt = tools.length > 0 ? buildToolPrompt(system, tools, forceText) : system
+  // The Prompt API requires the system prompt to be the first message and
+  // allows exactly one. History follows it; the current turn is sent with
+  // promptStreaming(), never as another system message.
   if (prompt) initialPrompts.push({ role: 'system', content: prompt })
   initialPrompts.push(...history.map(toPlainMessage))
 
-  const options: Record<string, unknown> = { initialPrompts }
+  const options: Record<string, unknown> = {
+    initialPrompts,
+    expectedInputs: [{ type: 'text' }],
+    expectedOutputs: [{ type: 'text' }],
+  }
   if (signal) options.signal = signal
   return languageModel.create(options)
 }
