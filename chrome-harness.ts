@@ -373,6 +373,8 @@ export interface HarnessFs {
   /** Create a file, failing if it already exists. */
   createFile: (path: string, content: string) => Promise<boolean>
   deleteFile: (path: string) => Promise<boolean>
+  /** Create a directory and any missing parents. */
+  createDirectory?: (path: string) => Promise<boolean>
   /** Current editor markers, including unsaved files. */
   getDiagnostics?: () => HarnessDiagnostic[]
   /** The file currently open in the editor, including unsaved changes. */
@@ -699,6 +701,83 @@ export function createHarnessTools(fs: HarnessFs): HarnessTool[] {
       },
     },
     {
+      name: 'makeDirectory',
+      description: 'Create a directory. Parent directories are created automatically.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'Directory path relative to the project root.' },
+        },
+        required: ['path'],
+      },
+      execute: async ({ path }) => {
+        if (!fs.createDirectory) return { error: 'Directory creation is not available.' }
+        const check = checkProjectPath(path)
+        if ('error' in check) return { error: check.error }
+        const ok = await fs.createDirectory(check.path)
+        return ok ? { path: check.path, created: true } : { error: `Failed to create ${check.path}` }
+      },
+    },
+    {
+      name: 'moveFile',
+      description: 'Rename or move a file. Read the source with readFile first. Fails if the source is missing or the destination already exists.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          from: { type: 'string', description: 'Current file path.' },
+          to: { type: 'string', description: 'New file path.' },
+        },
+        required: ['from', 'to'],
+      },
+      execute: async ({ from: fromRaw, to: toRaw }) => {
+        const from = checkProjectPath(fromRaw)
+        if ('error' in from) return { error: from.error }
+        const to = checkProjectPath(toRaw)
+        if ('error' in to) return { error: to.error }
+        if (from.path === to.path) return { error: 'Source and destination are the same.' }
+        const guard = ensureRead(from.path)
+        if (guard) return { error: guard }
+        const content = await fs.readFile(from.path)
+        if (content == null) return { error: `File not found: ${from.path}` }
+        if (content.length > MAX_WRITE_CHARS) return { error: `Refusing to move ${content.length} characters (limit ${MAX_WRITE_CHARS}).` }
+        const created = await fs.createFile(to.path, content)
+        if (!created) return { error: `Failed to create ${to.path} (it may already exist)` }
+        const removed = await fs.deleteFile(from.path)
+        if (!removed) return { error: `Copied ${from.path} to ${to.path} but could not remove the source.` }
+        clearedForEdit.delete(from.path)
+        clearedForEdit.add(to.path)
+        return { from: from.path, path: to.path, moved: true }
+      },
+    },
+    {
+      name: 'copyFile',
+      description: 'Copy a file. Read the source with readFile first. Fails if the destination already exists.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          from: { type: 'string', description: 'Source file path.' },
+          to: { type: 'string', description: 'Destination file path.' },
+        },
+        required: ['from', 'to'],
+      },
+      execute: async ({ from: fromRaw, to: toRaw }) => {
+        const from = checkProjectPath(fromRaw)
+        if ('error' in from) return { error: from.error }
+        const to = checkProjectPath(toRaw)
+        if ('error' in to) return { error: to.error }
+        if (from.path === to.path) return { error: 'Source and destination are the same.' }
+        const guard = ensureRead(from.path)
+        if (guard) return { error: guard }
+        const content = await fs.readFile(from.path)
+        if (content == null) return { error: `File not found: ${from.path}` }
+        if (content.length > MAX_WRITE_CHARS) return { error: `Refusing to copy ${content.length} characters (limit ${MAX_WRITE_CHARS}).` }
+        const created = await fs.createFile(to.path, content)
+        if (!created) return { error: `Failed to create ${to.path} (it may already exist)` }
+        clearedForEdit.add(to.path)
+        return { from: from.path, path: to.path, copied: true }
+      },
+    },
+    {
       name: 'replaceInFile',
       description: 'Preferred edit tool. Replaces one exact snippet in a file you have already read this turn. Fails when oldText is missing or matches more than once unless replaceAll is true. Keep oldText large enough to be unique and include surrounding context.',
       inputSchema: {
@@ -735,6 +814,76 @@ export function createHarnessTools(fs: HarnessFs): HarnessTool[] {
         }
         const ok = await fs.writeFile(file, next)
         return ok ? { path: file, replacements: replaceAll === true ? count : 1 } : { error: `Failed to write ${file}` }
+      },
+    },
+    {
+      name: 'applyPatch',
+      description: 'Apply multiple exact replacements across one or more files in one call. Read every file first. Edits are applied in order; all are validated before anything is written.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          edits: {
+            type: 'array',
+            description: 'Replacements to apply in order.',
+            items: {
+              type: 'object',
+              properties: {
+                path: { type: 'string', description: 'File path relative to the project root.' },
+                oldText: { type: 'string', description: 'Exact text to replace, unique unless replaceAll is true.' },
+                newText: { type: 'string', description: 'Replacement text.' },
+                replaceAll: { type: 'boolean', description: 'Replace every occurrence. Defaults to false.' },
+              },
+              required: ['path', 'oldText', 'newText'],
+            },
+          },
+        },
+        required: ['edits'],
+      },
+      execute: async ({ edits }) => {
+        if (!Array.isArray(edits) || edits.length === 0) return { error: 'edits must be a non-empty array' }
+        const working = new Map<string, string>()
+        const counts = new Map<string, number>()
+        for (const raw of edits) {
+          if (!raw || typeof raw !== 'object') return { error: 'Each edit must be an object.' }
+          // Each item was validated by the tool's JSON Schema.
+          const edit = raw as Record<string, unknown>
+          const check = checkProjectPath(edit.path)
+          if ('error' in check) return { error: check.error }
+          const file = check.path
+          const guard = ensureRead(file)
+          if (guard) return { error: guard }
+          const needle = String(edit.oldText ?? '')
+          if (!needle) return { error: `oldText is required for ${file}` }
+          let content = working.get(file)
+          if (content === undefined) {
+            const read = await fs.readFile(file)
+            if (read == null) return { error: `File not found: ${file}` }
+            content = read
+          }
+          const replacement = String(edit.newText ?? '')
+          const count = content.split(needle).length - 1
+          if (count === 0) return { error: `oldText was not found in ${file}` }
+          if (count > 1 && edit.replaceAll !== true) {
+            return { error: `oldText matches ${count} times in ${file}; add surrounding context or set replaceAll to true` }
+          }
+          const next = edit.replaceAll === true
+            ? content.split(needle).join(replacement)
+            : content.slice(0, content.indexOf(needle)) + replacement + content.slice(content.indexOf(needle) + needle.length)
+          if (next.length > MAX_WRITE_CHARS) {
+            return { error: `Refusing to write ${next.length} characters (limit ${MAX_WRITE_CHARS}). Split the change into smaller edits.` }
+          }
+          working.set(file, next)
+          counts.set(file, (counts.get(file) ?? 0) + (edit.replaceAll === true ? count : 1))
+        }
+        for (const [file, content] of working) {
+          const ok = await fs.writeFile(file, content)
+          if (!ok) return { error: `Failed to write ${file}` }
+          clearedForEdit.add(file)
+        }
+        return {
+          count: working.size,
+          files: [...working.keys()].map(path => ({ path, replacements: counts.get(path) ?? 0 })),
+        }
       },
     },
     {

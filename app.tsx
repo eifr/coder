@@ -77,7 +77,7 @@ interface ChatChunk {
   usage: unknown
   /** Human-readable loading state, e.g. while the on-device model prepares. */
   status?: string
-  tool?: { name: string; path?: string; ok?: boolean }
+  tool?: { name: string; path?: string; from?: string; ok?: boolean }
 }
 
 declare global {
@@ -264,7 +264,10 @@ You can inspect and modify the user's local project with tools:
 - getOpenFile / getSelection: read the open editor file or selected text
 - getDiagnostics: current editor errors and warnings
 - createFile: create a new file (fails if it already exists)
+- makeDirectory: create a directory
+- moveFile / copyFile: rename or copy a file (read it first)
 - replaceInFile: replace one exact, unique snippet (preferred edit)
+- applyPatch: apply multiple replacements across files in one call (read each file first)
 - editFile: rewrite a whole file (last resort)
 - deleteFile: remove a file (only when explicitly asked)
 
@@ -371,6 +374,38 @@ async function readDirEntries(dirHandle: FileSystemDirectoryHandle, path = '', g
   }
   entries.sort(compareEntries)
   return entries
+}
+
+async function readExpandedTree(
+  handle: FileSystemDirectoryHandle,
+  expanded: Set<string>,
+  generation: number
+): Promise<FileEntry[]> {
+  const entries = await readDirEntries(handle, '', generation)
+  return expandTreeEntries(entries, expanded, generation)
+}
+
+async function expandTreeEntries(
+  entries: FileEntry[],
+  expanded: Set<string>,
+  generation: number
+): Promise<FileEntry[]> {
+  const result: FileEntry[] = []
+  for (const entry of entries) {
+    if (entry.type !== 'dir' || !expanded.has(entry.path)) {
+      result.push(entry)
+      continue
+    }
+    try {
+      // entry.type === 'dir' guarantees a directory handle.
+      const dir = entry.handle as FileSystemDirectoryHandle
+      const children = await readDirEntries(dir, entry.path, generation)
+      result.push({ ...entry, children: await expandTreeEntries(children, expanded, generation), loaded: true })
+    } catch {
+      result.push(entry)
+    }
+  }
+  return result
 }
 
 const MAX_INDEX_ENTRIES = 50000
@@ -795,6 +830,7 @@ function stopGeneration(): void {
 const CHROME_MODEL = createChromeModels()
 const MAX_AGENT_TURNS = 8
 const MAX_AGENT_TOOL_RESULT = 24000
+const MUTATING_TOOLS = new Set(['createFile', 'editFile', 'replaceInFile', 'deleteFile', 'makeDirectory', 'moveFile', 'copyFile', 'applyPatch'])
 
 function modelContentText(content: unknown): string {
   if (typeof content === 'string') return content
@@ -860,9 +896,13 @@ function toAgentTool(tool: HarnessTool): AgentTool {
   }
 }
 
-function toolPathFromArgs(args: unknown): string | undefined {
-  if (!args || typeof args !== 'object' || !('path' in args) || typeof args.path !== 'string') return undefined
-  return args.path.replace(/\\/g, '/').replace(/^\.?\//, '').replace(/\/+$/, '')
+function toolArgPath(args: unknown, key: string): string | undefined {
+  if (!args || typeof args !== 'object' || !(key in args)) return undefined
+  // `key in args` narrows to object; the record view reads the dynamic key.
+  const record = args as Record<string, unknown>
+  const value = record[key]
+  if (typeof value !== 'string') return undefined
+  return value.replace(/\\/g, '/').replace(/^\.?\//, '').replace(/\/+$/, '')
 }
 
 interface ChunkQueue {
@@ -921,6 +961,7 @@ async function* streamPiAgent(
 
   const queue = createChunkQueue()
   const toolPaths = new Map<string, string>()
+  const toolFroms = new Map<string, string>()
   let visible = ''
   let toolCalls = 0
   let turns = 0
@@ -958,20 +999,23 @@ async function* streamPiAgent(
       return
     }
     if (event.type === 'tool_execution_start') {
-      const path = toolPathFromArgs(event.args)
+      const path = toolArgPath(event.args, 'path') ?? toolArgPath(event.args, 'to')
+      const from = toolArgPath(event.args, 'from')
       toolPaths.set(event.toolCallId, path || '')
+      if (from) toolFroms.set(event.toolCallId, from)
       queue.push({
         text: visible,
         done: false,
         delta: '',
         usage: null,
         status: `Running ${event.toolName}…`,
-        tool: { name: event.toolName, path },
+        tool: { name: event.toolName, path, from },
       })
       return
     }
     if (event.type === 'tool_execution_end') {
       const path = toolPaths.get(event.toolCallId)
+      const from = toolFroms.get(event.toolCallId)
       lastToolResult = event.result.content
         .map((part: { type: string; text?: string }) => part.type === 'text' ? part.text ?? '' : '')
         .join('')
@@ -981,7 +1025,7 @@ async function* streamPiAgent(
         done: false,
         delta: '',
         usage: null,
-        tool: { name: event.toolName, path, ok: !event.isError },
+        tool: { name: event.toolName, path, from, ok: !event.isError },
       })
     }
   })
@@ -1094,29 +1138,6 @@ function addFileToTree(entries: FileEntry[] | null, path: string, entry: FileEnt
   return walk(entries, 0)
 }
 
-/** Removes a file deleted by a tool from every loaded branch of the tree. */
-function removeFileFromTree(entries: FileEntry[] | null, path: string): FileEntry[] | null {
-  if (!entries) return null
-  let changed = false
-  const next: FileEntry[] = []
-  for (const entry of entries) {
-    if (entry.path === path) {
-      changed = true
-      continue
-    }
-    if (entry.children && path.startsWith(`${entry.path}/`)) {
-      const children = removeFileFromTree(entry.children, path)
-      if (children !== entry.children) {
-        changed = true
-        next.push({ ...entry, children: children ?? [] })
-        continue
-      }
-    }
-    next.push(entry)
-  }
-  return changed ? next : entries
-}
-
 function buildFileTree(treeData: FileEntry[]): string {
   const lines = [`Project: ${rootDirName}`, '']
   function flat(entries: FileEntry[], p = '') {
@@ -1205,6 +1226,18 @@ async function createFileForTool(path: string, content: string): Promise<boolean
     fileHandles.set(path, { handle: fh, name, path, type: 'file' })
     return true
   } catch { return false }
+}
+
+async function createDirectoryForTool(path: string): Promise<boolean> {
+  const safe = safeProjectPath(path)
+  if (!safe || !rootDirHandle) return false
+  try {
+    let dir: FileSystemDirectoryHandle = rootDirHandle
+    for (const part of safe.split('/')) dir = await dir.getDirectoryHandle(part, { create: true })
+    return true
+  } catch {
+    return false
+  }
 }
 
 async function deleteFileForTool(path: string): Promise<boolean> {
@@ -2343,6 +2376,19 @@ function App() {
     if (entries) applyFolder(entries)
   }, [dirtyFiles, applyFolder])
 
+  const refreshTree = useCallback(async () => {
+    if (!rootDirHandle) return
+    const generation = folderGeneration
+    try {
+      const entries = await readExpandedTree(rootDirHandle, expandedPaths, generation)
+      if (generation !== folderGeneration) return
+      setTreeData(entries)
+      setIndexedCount(fileHandles.size)
+    } catch (err) {
+      console.warn('refreshTree:', err)
+    }
+  }, [expandedPaths])
+
   const handleRefreshCommits = useCallback(async () => {
     if (!rootDirHandle) {
       setRecentCommits([])
@@ -2522,6 +2568,7 @@ function App() {
         writeFile: applyFileChanges,
         createFile: createFileForTool,
         deleteFile: deleteFileForTool,
+        createDirectory: createDirectoryForTool,
         getDiagnostics: collectEditorDiagnostics,
         getOpenFile: readOpenFileForTool,
         getSelection: readSelectionForTool,
@@ -2551,14 +2598,31 @@ function App() {
       let full = ''
       for await (const chunk of streamChat(chatMsgs, systemMsg, tools, abortController.signal)) {
         if (abortRef.current) break
-        if (chunk.tool?.ok && chunk.tool.path) {
-          const { name, path } = chunk.tool
-          if (name === 'deleteFile') {
-            setTreeData((prev: FileEntry[] | null) => removeFileFromTree(prev, path))
-          } else if (name === 'createFile' || name === 'editFile' || name === 'replaceInFile') {
-            const entry = fileHandles.get(path)
-            if (entry) setTreeData((prev: FileEntry[] | null) => addFileToTree(prev, path, entry))
+        if (chunk.tool?.ok) {
+          const { name, path, from } = chunk.tool
+          if (name === 'moveFile' && from && path) {
+            const oldModel = monacoModels.get(from)
+            if (oldModel) {
+              oldModel.dispose()
+              monacoModels.delete(from)
+            }
+            savedContents.delete(from)
+            setOpenFiles((prev: string[]) => prev.map(item => item === from ? path : item))
+            setDirtyFiles(prev => {
+              const next = new Set(prev)
+              next.delete(from)
+              next.delete(path)
+              return next
+            })
+            if (selectedFile === from) {
+              setSelectedFile(path)
+              void loadFile(path)
+            }
+          } else if (name === 'deleteFile' && path) {
+            setOpenFiles((prev: string[]) => prev.filter(item => item !== path))
+            if (selectedFile === path) setSelectedFile(null)
           }
+          if (MUTATING_TOOLS.has(name)) void refreshTree()
         }
         if (chunk.status) setGenerationStatus(chunk.status)
         full = chunk.text
@@ -2590,7 +2654,7 @@ function App() {
       setStreamingContent('')
       setGenerationStatus('')
     }
-  }, [messages, modelLoaded, currentModel, attachContext, treeData, selectedProvider])
+  }, [messages, modelLoaded, currentModel, attachContext, treeData, selectedProvider, selectedFile, refreshTree])
 
   const handleStop = useCallback(() => { abortRef.current = true; stopGeneration() }, [])
   const handleClear = useCallback(() => { setMessages([]); setStreamingContent(''); setCodeBlocks([]); saveState({ messages: [] }) }, [])
