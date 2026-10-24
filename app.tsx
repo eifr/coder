@@ -98,7 +98,7 @@ declare global {
 
 const STORAGE_KEY = 'coder-state'
 // Bump this when debugging a stale PWA/dev bundle; shown in the Model tab.
-const APP_BUILD = 'chrome-fallback-3'
+const APP_BUILD = 'chrome-fallback-4'
 
 interface PersistedState {
   selectedProvider: Provider
@@ -2574,7 +2574,10 @@ function App() {
     setCodeBlocks([])
     abortRef.current = false
 
-    const fileTree = attachContext && treeData ? buildFileTree(treeData) : null
+    // Pure greetings should not pay for a 15-tool structured session.
+    const conversational = text.trim().length < 80 && /^(hi|hello|hey|thanks|thank you|ok|okay|sure|yes|no|who are you|what can you do|how are you)\b[!.?\s]*$/i.test(text.trim())
+    const useContext = attachContext && !!treeData && !conversational
+    const fileTree = useContext && treeData ? buildFileTree(treeData) : null
     let plainSystem = fileTree ? `${SYSTEM_PROMPT}\n\nProject file tree:\n${fileTree}` : SYSTEM_PROMPT
     // pi rebuilds the transcript per provider request, so send the full history.
     const chatMsgs: ModelMessage[] = [
@@ -2583,7 +2586,6 @@ function App() {
         .map(m => ({ role: m.role, content: m.content } as ModelMessage)),
     ]
 
-    const useContext = attachContext && !!treeData
     let tools: HarnessTool[] | undefined
     if (useContext) {
       tools = createHarnessTools({
@@ -2599,10 +2601,10 @@ function App() {
       })
     }
 
-    // Seed every turn with the open file. Small models lack project-wide memory;
-    // with tools this also saves an extra readFile round trip.
+    // Seed tool-enabled turns with the open file. Small models lack project-wide
+    // memory; with tools this also saves an extra readFile round trip.
     let openFileBlock = ''
-    if (currentFilePath && editor) {
+    if (useContext && currentFilePath && editor) {
       const model = editor.getModel()
       if (model) {
         let code = model.getValue()
