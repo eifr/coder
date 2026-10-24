@@ -6,7 +6,7 @@ import { createLocalModels } from './pi-local-provider'
 import { Agent, type AgentMessage, type AgentTool } from '@earendil-works/pi-agent-core'
 import { Type, type Model, type Models } from '@earendil-works/pi-ai'
 import { CHROME_API, MODEL_ID, PROVIDER_ID, createChromeModels } from './pi-chrome-provider'
-import type { LanguageModel, ModelMessage } from 'ai'
+import type { LanguageModel } from 'ai'
 
 interface Notification {
   id: number
@@ -98,14 +98,15 @@ declare global {
 
 const STORAGE_KEY = 'coder-state'
 // Bump this when debugging a stale PWA/dev bundle; shown in the Model tab.
-const APP_BUILD = 'chrome-fallback-5'
+const APP_BUILD = 'offline-session-6'
 
 interface PersistedState {
   selectedProvider: Provider
   selectedModel: string
   customModelUrl: string
   attachContext: boolean
-  messages: Message[]
+  /** Legacy text-only chat history, migrated into the session store on load. */
+  messages?: Message[]
   openFiles: string[]
   selectedFile: string | null
   projectName: string
@@ -502,19 +503,25 @@ function getLanguage(filePath: string): string {
 const WORKSPACE_DB = 'coder-workspace'
 const WORKSPACE_STORE = 'workspace'
 const WORKSPACE_KEY = 'root'
+const SESSION_STORE = 'sessions'
+/** Session key for a conversation that has no project folder. */
+const SESSION_KEY_FALLBACK = '__chat__'
 
 /**
  * `FileSystemDirectoryHandle`s are structured-cloneable, so IndexedDB can keep
  * the last project across reloads. Permission itself is not persisted: Chrome
  * may require a click to re-grant it, which the sidebar prompts for.
+ *
+ * Version 2 adds the `sessions` store; both stores are created defensively so
+ * an interrupted upgrade cannot leave the handler store missing.
  */
 function openWorkspaceDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open(WORKSPACE_DB, 1)
+    const request = indexedDB.open(WORKSPACE_DB, 2)
     request.onupgradeneeded = () => {
-      if (!request.result.objectStoreNames.contains(WORKSPACE_STORE)) {
-        request.result.createObjectStore(WORKSPACE_STORE)
-      }
+      const db = request.result
+      if (!db.objectStoreNames.contains(WORKSPACE_STORE)) db.createObjectStore(WORKSPACE_STORE)
+      if (!db.objectStoreNames.contains(SESSION_STORE)) db.createObjectStore(SESSION_STORE)
     }
     request.onsuccess = () => resolve(request.result)
     request.onerror = () => reject(request.error)
@@ -568,6 +575,88 @@ async function clearStoredRootHandle(): Promise<void> {
   } catch (err) {
     console.warn('clearStoredRootHandle:', err)
   }
+}
+
+interface StoredSession {
+  version: 1
+  projectName: string
+  updatedAt: number
+  /** `running` is only ever read after a reload, where it means "interrupted". */
+  status: 'idle' | 'running' | 'interrupted'
+  uiMessages: Message[]
+  /** Agent transcript without system messages; structured-clone safe. */
+  agentMessages: AgentMessage[]
+}
+
+/** Session key: the folder name when a project is open, otherwise the fallback. */
+function sessionStoreKey(projectName: string): string {
+  return `session.${projectName || SESSION_KEY_FALLBACK}`
+}
+
+async function readStoredSession(projectName: string): Promise<StoredSession | null> {
+  try {
+    const db = await openWorkspaceDb()
+    const session = await new Promise<StoredSession | null>((resolve, reject) => {
+      const tx = db.transaction(SESSION_STORE, 'readonly')
+      const request = tx.objectStore(SESSION_STORE).get(sessionStoreKey(projectName))
+      request.onsuccess = () => resolve((request.result as StoredSession | undefined) ?? null)
+      request.onerror = () => reject(request.error)
+    })
+    db.close()
+    return session
+  } catch (err) {
+    console.warn('readStoredSession:', err)
+    return null
+  }
+}
+
+async function writeStoredSession(session: StoredSession): Promise<boolean> {
+  try {
+    const db = await openWorkspaceDb()
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(SESSION_STORE, 'readwrite')
+      tx.objectStore(SESSION_STORE).put(session, sessionStoreKey(session.projectName))
+      tx.oncomplete = () => resolve()
+      tx.onerror = () => reject(tx.error)
+      tx.onabort = () => reject(tx.error)
+    })
+    db.close()
+    return true
+  } catch (err) {
+    console.warn('writeStoredSession:', err)
+    return false
+  }
+}
+
+async function clearStoredSession(projectName: string): Promise<void> {
+  try {
+    const db = await openWorkspaceDb()
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(SESSION_STORE, 'readwrite')
+      tx.objectStore(SESSION_STORE).delete(sessionStoreKey(projectName))
+      tx.oncomplete = () => resolve()
+      tx.onerror = () => reject(tx.error)
+      tx.onabort = () => reject(tx.error)
+    })
+    db.close()
+  } catch (err) {
+    console.warn('clearStoredSession:', err)
+  }
+}
+
+const PROJECT_INSTRUCTION_FILES = ['AGENTS.md', 'AGENTS.MD', 'CLAUDE.md', 'CLAUDE.MD']
+
+/** Reads the project's own instructions (offline, no network). */
+async function readProjectInstructions(handle: FileSystemDirectoryHandle | null): Promise<string> {
+  if (!handle) return ''
+  for (const name of PROJECT_INSTRUCTION_FILES) {
+    try {
+      const file = await handle.getFileHandle(name)
+      const text = (await (await file.getFile()).text()).trim()
+      if (text) return text.slice(0, 16000)
+    } catch {}
+  }
+  return ''
 }
 
 async function activateFolder(
@@ -832,46 +921,105 @@ function stopGeneration(): void {
 const CHROME_MODEL = createChromeModels()
 const MAX_AGENT_TURNS = 8
 const MAX_AGENT_TOOL_RESULT = 24000
+/** Character budget for one provider request (the Chrome window is ~9k tokens). */
+const MAX_REQUEST_CHARS = 18000
 const MUTATING_TOOLS = new Set(['createFile', 'editFile', 'replaceInFile', 'deleteFile', 'makeDirectory', 'moveFile', 'copyFile', 'applyPatch'])
 
-function modelContentText(content: unknown): string {
-  if (typeof content === 'string') return content
-  if (!Array.isArray(content)) return ''
-  return content.map(part => {
-    if (!part || typeof part !== 'object') return ''
-    if ('type' in part && part.type === 'text' && 'text' in part && typeof part.text === 'string') return part.text
-    return ''
-  }).join('')
+function assistantHasToolCall(message: AgentMessage): boolean {
+  if (message.role !== 'assistant') return false
+  return message.content.some(part => part.type === 'toolCall')
 }
 
-function toAgentHistory(messages: ModelMessage[]): AgentMessage[] {
-  const history: AgentMessage[] = []
-  for (const message of messages) {
-    if (message.role !== 'user' && message.role !== 'assistant') continue
-    const text = modelContentText(message.content)
-    if (message.role === 'user') {
-      history.push({ role: 'user', content: text, timestamp: Date.now() })
-      continue
-    }
-    history.push({
-      role: 'assistant',
-      content: [{ type: 'text', text }],
-      api: CHROME_API,
-      provider: PROVIDER_ID,
-      model: MODEL_ID,
-      usage: {
-        input: 0,
-        output: 0,
-        cacheRead: 0,
-        cacheWrite: 0,
-        totalTokens: 0,
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-      },
-      stopReason: 'stop',
-      timestamp: Date.now(),
-    })
+/** An assistant message the model never finished: an aborted request. */
+function assistantWasAborted(message: AgentMessage): boolean {
+  return message.role === 'assistant' && (message as { stopReason?: string }).stopReason === 'aborted'
+}
+
+/**
+ * Makes a persisted transcript safe to hand to `Agent.continue()`: system
+ * messages are rebuilt from the live prompt, a trailing assistant tool-call
+ * message means the turn died before its results, an aborted assistant message
+ * carries no answer, and a leading tool result has lost the call it answers.
+ */
+function sanitizeTranscript(messages: AgentMessage[]): AgentMessage[] {
+  const kept = messages.filter(message => message.role !== 'system')
+  while (kept.length > 0) {
+    const tail = kept[kept.length - 1]
+    if (!assistantHasToolCall(tail) && !assistantWasAborted(tail)) break
+    kept.pop()
   }
-  return history
+  while (kept.length > 0 && kept[0].role === 'toolResult') kept.shift()
+  return kept
+}
+
+/**
+ * Deterministic window for one provider request. The full transcript stays in
+ * state and IndexedDB; only this view is trimmed, so long sessions cannot
+ * overflow the on-device context.
+ */
+function trimAgentMessages(messages: AgentMessage[]): AgentMessage[] {
+  const systemMessages: AgentMessage[] = []
+  const conversation: AgentMessage[] = []
+  for (const message of messages) {
+    if (message.role === 'system') systemMessages.push(message)
+    else conversation.push(message)
+  }
+
+  let budget = MAX_REQUEST_CHARS
+  for (const message of systemMessages) budget -= JSON.stringify(message).length
+
+  const kept: AgentMessage[] = []
+  let chars = 0
+  for (let index = conversation.length - 1; index >= 0; index--) {
+    const message = conversation[index]
+    const size = JSON.stringify(message).length
+    // Always keep the final message: the request needs it.
+    if (kept.length > 0 && chars + size > budget) break
+    kept.push(message)
+    chars += size
+  }
+  kept.reverse()
+
+  while (kept.length > 0 && kept[0].role !== 'user') kept.shift()
+  while (kept.length > 1 && kept[kept.length - 1].role === 'toolResult') {
+    const tail = kept[kept.length - 1]
+    const answered = kept.some(message =>
+      message.role === 'assistant' && message.content.some(part => part.type === 'toolCall' && part.id === (tail as { toolCallId: string }).toolCallId))
+    if (answered) break
+    kept.pop()
+  }
+  return [...systemMessages, ...kept]
+}
+
+/** Builds an assistant message for a legacy text-only UI message. */
+function legacyAssistantMessage(text: string): AgentMessage {
+  return {
+    role: 'assistant',
+    content: [{ type: 'text', text }],
+    api: CHROME_API,
+    provider: PROVIDER_ID,
+    model: MODEL_ID,
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: 'stop',
+    timestamp: Date.now(),
+  }
+}
+
+/** Legacy `saved.messages` hold no tool transcript, so only text survives. */
+function legacyTranscript(messages: Message[]): AgentMessage[] {
+  const transcript: AgentMessage[] = []
+  for (const message of messages) {
+    if (message.role === 'user') transcript.push({ role: 'user', content: message.content, timestamp: Date.now() })
+    else if (message.role === 'assistant') transcript.push(legacyAssistantMessage(message.content))
+  }
+  return transcript
 }
 
 function toAgentTool(tool: HarnessTool): AgentTool {
@@ -950,17 +1098,12 @@ function createChunkQueue(): ChunkQueue {
 async function* streamPiAgent(
   models: Models,
   model: Model<any>,
-  messages: ModelMessage[],
+  history: AgentMessage[],
   system: string | undefined,
   tools: HarnessTool[],
-  signal?: AbortSignal
+  signal: AbortSignal | undefined,
+  onTranscript: (messages: AgentMessage[]) => void
 ): AsyncGenerator<ChatChunk> {
-
-  const chat = messages.filter(message => message.role === 'user' || message.role === 'assistant')
-  const last = chat[chat.length - 1]
-  if (!last) throw new Error('No user message to send.')
-  const prompt = modelContentText(last.content)
-
   const queue = createChunkQueue()
   const toolPaths = new Map<string, string>()
   const toolFroms = new Map<string, string>()
@@ -977,10 +1120,11 @@ async function* streamPiAgent(
       systemPrompt: system || '',
       model,
       tools: tools.map(toAgentTool),
-      messages: toAgentHistory(chat.slice(0, -1)),
+      messages: history.filter(message => message.role !== 'system'),
     },
     streamFn: models.streamSimple.bind(models),
     convertToLlm: messages => messages,
+    transformContext: async messages => trimAgentMessages(messages),
     toolExecution: 'sequential',
     finishTurn: async () => {
       turns++
@@ -1041,7 +1185,7 @@ async function* streamPiAgent(
     signal?.removeEventListener('abort', onAbort)
   }
 
-  const run = agent.prompt(prompt).catch(error => {
+  const run = agent.continue().catch(error => {
     failure = error instanceof Error ? error : new Error(String(error))
   }).finally(() => {
     finished = true
@@ -1055,6 +1199,14 @@ async function* streamPiAgent(
       : toolCalls > 0
         ? `The model completed ${toolCalls} tool call${toolCalls === 1 ? '' : 's'} without a final summary.${resultPreview ? `\n\nLast tool result:\n${resultPreview}` : ''}`
         : ''
+    // Report before closing so the caller persists the turn even if it stopped
+    // consuming chunks (for example on abort).
+    const transcript = agent.state.messages.filter(message => message.role !== 'system')
+    try {
+      onTranscript(transcript)
+    } catch (err) {
+      console.warn('[coder] session transcript callback failed', err)
+    }
     queue.push({ text: visible || fallback, done: true, delta: '', usage: null })
     queue.close()
     cleanup()
@@ -1070,7 +1222,13 @@ async function* streamPiAgent(
   }
 }
 
-async function* streamChat(messages: ModelMessage[], system?: string, tools?: HarnessTool[], signal?: AbortSignal): AsyncGenerator<ChatChunk> {
+async function* streamChat(
+  history: AgentMessage[],
+  system: string | undefined,
+  tools: HarnessTool[] | undefined,
+  signal: AbortSignal | undefined,
+  onTranscript: (messages: AgentMessage[]) => void
+): AsyncGenerator<ChatChunk> {
   if (!currentModel) throw new Error('Model not initialized')
   const provider = (currentModel as any).provider || PROVIDERS.WEBLLM
   console.info('[coder] streamChat', APP_BUILD, provider)
@@ -1078,7 +1236,7 @@ async function* streamChat(messages: ModelMessage[], system?: string, tools?: Ha
   if (provider === PROVIDERS.BROWSER_AI) {
     const model = CHROME_MODEL.getModel(PROVIDER_ID, MODEL_ID)
     if (!model) throw new Error('Chrome Built-in AI model is not registered.')
-    yield* streamPiAgent(CHROME_MODEL, model, messages, system, tools || [], signal)
+    yield* streamPiAgent(CHROME_MODEL, model, history, system, tools || [], signal, onTranscript)
     return
   }
 
@@ -1086,7 +1244,7 @@ async function* streamChat(messages: ModelMessage[], system?: string, tools?: Ha
   const localModels = createLocalModels({ provider, model: currentModel, modelId })
   const model = localModels.getModels()[0]
   if (!model) throw new Error('Local model is not registered.')
-  yield* streamPiAgent(localModels, model, messages, system, tools || [], signal)
+  yield* streamPiAgent(localModels, model, history, system, tools || [], signal, onTranscript)
 }
 
 function parseCodeBlocks(text: string): CodeBlock[] {
@@ -1454,9 +1612,11 @@ interface ChatPanelProps {
   projectOpen: boolean
   draft: string
   onDraftConsumed: () => void
+  interrupted: boolean
+  onResume: () => void
 }
 
-function ChatPanel({ messages, streamingContent, codeBlocks, isGenerating, generationStatus, onSend, onStop, onApply, onClear, onExport, modelLoaded, modelList, selectedModel, onModelChange, modelLoading, initProgress, onLoadModel, attachContext, onAttachContextChange, customModelUrl, onCustomModel, selectedProvider, onProviderChange, onShowBuiltInAI, projectOpen, draft, onDraftConsumed }: ChatPanelProps) {
+function ChatPanel({ messages, streamingContent, codeBlocks, isGenerating, generationStatus, onSend, onStop, onApply, onClear, onExport, modelLoaded, modelList, selectedModel, onModelChange, modelLoading, initProgress, onLoadModel, attachContext, onAttachContextChange, customModelUrl, onCustomModel, selectedProvider, onProviderChange, onShowBuiltInAI, projectOpen, draft, onDraftConsumed, interrupted, onResume }: ChatPanelProps) {
   const endRef = useRef<HTMLDivElement | null>(null)
   const [input, setInput] = useState('')
   const [confirmClear, setConfirmClear] = useState(false)
@@ -1534,6 +1694,16 @@ function ChatPanel({ messages, streamingContent, codeBlocks, isGenerating, gener
             <button class="px-2 py-0.5 rounded bg-accent hover:bg-accent-strong text-accent-ink text-[10px] font-medium shrink-0" onClick=${() => onAttachContextChange(true)}>Enable</button>
           </div>
         `) : ''}
+        ${interrupted ? html`
+          <div class="px-3 py-2 border-b border-line flex items-center justify-between gap-2 text-[10.5px]">
+            <span class="text-accent">${projectOpen ? 'Last turn was interrupted.' : 'Reopen the project to resume this turn.'}</span>
+            <button
+              class="px-2 py-0.5 rounded bg-accent hover:bg-accent-strong text-accent-ink text-[10px] font-medium shrink-0 disabled:opacity-40 disabled:cursor-not-allowed"
+              onClick=${onResume}
+              disabled=${!modelLoaded || !projectOpen || isGenerating}
+            >Resume</button>
+          </div>
+        ` : ''}
         <div class="flex-1 overflow-y-auto p-3 space-y-4">
           ${all.length===0 ? html`
             <div class="h-full flex flex-col items-center justify-center text-center px-4">
@@ -2224,7 +2394,10 @@ function App() {
   const [modelLoaded, setModelLoaded] = useState(false)
   const [modelLoading, setModelLoading] = useState(false)
   const [initProgress, setInitProgress] = useState<InitProgressState | null>(null)
-  const [messages, setMessages] = useState<Message[]>(saved.messages || [])
+  const [messages, setMessages] = useState<Message[]>([])
+  const [agentTranscript, setAgentTranscript] = useState<AgentMessage[]>([])
+  const [sessionProject, setSessionProject] = useState<string | null>(null)
+  const [interrupted, setInterrupted] = useState(false)
   const [streamingContent, setStreamingContent] = useState('')
   const [isGenerating, setIsGenerating] = useState(false)
   const [generationStatus, setGenerationStatus] = useState('')
@@ -2303,6 +2476,10 @@ function App() {
   const editorRef = useRef<HTMLDivElement | null>(null)
   const abortRef = useRef(false)
   const generatingRef = useRef(false)
+  /** Guards against a slow session read landing after a folder switch. */
+  const sessionSeq = useRef(0)
+  /** Mount-time localStorage snapshot, used once to migrate legacy chat history. */
+  const savedRef = useRef(saved)
   const closeBuiltInAI = useCallback(() => setShowBuiltInAI(false), [])
   const closeBuiltInTask = useCallback(() => setBuiltInTask(null), [])
   const replaceBuiltInSelection = useCallback((text: string) => {
@@ -2310,9 +2487,10 @@ function App() {
     setBuiltInTask(null)
   }, [builtInTask])
 
+  // The chat transcript lives in IndexedDB (`sessions`), not here.
   useEffect(() => {
-    saveState({ selectedProvider, selectedModel, customModelUrl, attachContext, messages })
-  }, [selectedProvider, selectedModel, customModelUrl, attachContext, messages])
+    saveState({ selectedProvider, selectedModel, customModelUrl, attachContext })
+  }, [selectedProvider, selectedModel, customModelUrl, attachContext])
 
   // Open tabs only make sense with a project loaded; saving them earlier would
   // overwrite the snapshot before the restore effect gets to read it.
@@ -2370,7 +2548,62 @@ function App() {
     editorReadyPromise = initMonaco(editorRef.current!).then(() => {})
   }, [])
 
-  const applyFolder = useCallback((entries: FileEntry[]) => {
+  /**
+   * Shows the stored conversation for `key` (a folder name, or the fallback
+   * key for a general chat). Legacy text-only history is migrated once.
+   */
+  const loadSession = useCallback(async (key: string) => {
+    const seq = ++sessionSeq.current
+    const session = await readStoredSession(key)
+    if (seq !== sessionSeq.current) return
+    if (session) {
+      const transcript = sanitizeTranscript(session.agentMessages)
+      const tail = transcript[transcript.length - 1]
+      // A user message or tool result at the tail means the turn never reached
+      // an answer, so it can be resumed.
+      const resumable = !!tail && (tail.role === 'user' || tail.role === 'toolResult')
+      const pending = session.status !== 'idle' || resumable
+      setMessages(session.uiMessages)
+      setAgentTranscript(transcript)
+      setSessionProject(key)
+      setInterrupted(pending)
+      if (session.status === 'running') {
+        await writeStoredSession({ ...session, status: 'interrupted', updatedAt: Date.now(), agentMessages: transcript })
+      }
+      return
+    }
+
+    const legacy = savedRef.current.messages ?? []
+    if (legacy.length > 0) {
+      const transcript = legacyTranscript(legacy)
+      setMessages(legacy)
+      setAgentTranscript(transcript)
+      setSessionProject(key)
+      setInterrupted(false)
+      const migrated = await writeStoredSession({
+        version: 1,
+        projectName: key,
+        updatedAt: Date.now(),
+        status: 'idle',
+        uiMessages: legacy,
+        agentMessages: transcript,
+      })
+      // Drop the legacy copy once it is in the session store, so a Clear does
+      // not resurrect it on the next load.
+      if (migrated) {
+        savedRef.current = { ...savedRef.current, messages: [] }
+        saveState({ messages: [] })
+      }
+      return
+    }
+
+    setMessages([])
+    setAgentTranscript([])
+    setSessionProject(key)
+    setInterrupted(false)
+  }, [])
+
+  const applyFolder = useCallback(async (entries: FileEntry[]) => {
     setMobilePanel(null)
     setIndexedCount(fileHandles.size)
     editor?.setModel(null)
@@ -2386,7 +2619,8 @@ function App() {
     currentFileHandle = null
     setSavedFile('')
     setRestorableProject(null)
-  }, [])
+    await loadSession(rootDirName || SESSION_KEY_FALLBACK)
+  }, [loadSession])
 
   const restoreTabs = useCallback(async (files: string[], active: string | null) => {
     if (editorReadyPromise) await editorReadyPromise
@@ -2406,7 +2640,7 @@ function App() {
   const handleOpenFolder = useCallback(async () => {
     if (dirtyFiles.size > 0 && !window.confirm('Change folder? Unsaved changes will be discarded.')) return
     const entries = await openFolder(setIndexedCount)
-    if (entries) applyFolder(entries)
+    if (entries) await applyFolder(entries)
   }, [dirtyFiles, applyFolder])
 
   const refreshTree = useCallback(async () => {
@@ -2443,7 +2677,7 @@ function App() {
         if (permission === 'granted') {
           const entries = await activateFolder(handle, setIndexedCount)
           if (entries && alive) {
-            applyFolder(entries)
+            await applyFolder(entries)
             if (saved.projectName === handle.name) {
               const files = [...(saved.openFiles ?? [])]
               if (saved.selectedFile && !files.includes(saved.selectedFile)) files.push(saved.selectedFile)
@@ -2476,7 +2710,7 @@ function App() {
       }
       const entries = await activateFolder(handle, setIndexedCount)
       if (entries) {
-        applyFolder(entries)
+        await applyFolder(entries)
         if (saved.projectName === handle.name) {
           const files = [...(saved.openFiles ?? [])]
           if (saved.selectedFile && !files.includes(saved.selectedFile)) files.push(saved.selectedFile)
@@ -2490,6 +2724,11 @@ function App() {
       setRestorableProject(null)
     }
   }, [applyFolder, restoreTabs])
+
+  // Show the last session straight away; a folder restore may supersede it.
+  useEffect(() => {
+    void loadSession(savedRef.current.projectName || SESSION_KEY_FALLBACK)
+  }, [loadSession])
 
   const handleToggleDir = useCallback((entry: FileEntry) => {
     const path = entry.path
@@ -2571,30 +2810,44 @@ function App() {
     setBuiltInTask({ kind: 'summarize-file', text, path: selectedFile })
   }, [selectedFile])
 
-  const handleSend = useCallback(async (text: string) => {
+  /**
+   * Runs one agent turn. `text` sends a new prompt; `null` resumes the stored
+   * turn whose prompt never reached an answer. The transcript is persisted
+   * before generation, after it, and on every abort/error path.
+   */
+  const runTurn = useCallback(async (text: string | null) => {
     if (!currentModel || !modelLoaded || generatingRef.current) return
+
+    let transcript: AgentMessage[]
+    let baseMessages: Message[]
+    if (text !== null) {
+      transcript = [...agentTranscript, { role: 'user', content: text, timestamp: Date.now() }]
+      baseMessages = [...messages, { role: 'user', content: text }]
+      setAgentTranscript(transcript)
+      setMessages(baseMessages)
+      setInterrupted(false)
+    } else {
+      // Resume adds no user message: the prompt is already in the transcript.
+      transcript = sanitizeTranscript(agentTranscript)
+      const tail = transcript[transcript.length - 1]
+      if (!tail || (tail.role !== 'user' && tail.role !== 'toolResult')) return
+      baseMessages = messages
+      setAgentTranscript(transcript)
+    }
+
     generatingRef.current = true
     abortController = new AbortController()
-    const userMsg: Message = { role: 'user', content: text }
-    const newMsgs = [...messages, userMsg]
-    setMessages(newMsgs)
+    abortRef.current = false
     setIsGenerating(true)
     setStreamingContent('')
     setGenerationStatus('')
     setCodeBlocks([])
-    abortRef.current = false
 
     // Pure greetings should not pay for a 15-tool structured session.
-    const conversational = text.trim().length < 80 && /^(hi|hello|hey|thanks|thank you|ok|okay|sure|yes|no|who are you|what can you do|how are you)\b[!.?\s]*$/i.test(text.trim())
+    const conversational = text !== null && text.trim().length < 80 && /^(hi|hello|hey|thanks|thank you|ok|okay|sure|yes|no|who are you|what can you do|how are you)\b[!.?\s]*$/i.test(text.trim())
     const useContext = attachContext && !!treeData && !conversational
     const fileTree = useContext && treeData ? buildFileTree(treeData) : null
     let plainSystem = fileTree ? `${SYSTEM_PROMPT}\n\nProject file tree:\n${fileTree}` : SYSTEM_PROMPT
-    // pi rebuilds the transcript per provider request, so send the full history.
-    const chatMsgs: ModelMessage[] = [
-      ...newMsgs
-        .filter(m => m.role === 'user' || m.role === 'assistant')
-        .map(m => ({ role: m.role, content: m.content } as ModelMessage)),
-    ]
 
     let tools: HarnessTool[] | undefined
     if (useContext) {
@@ -2630,9 +2883,33 @@ function App() {
       ? (fileTree ? `${TOOL_SYSTEM_PROMPT}\n\nProject file tree:\n${fileTree}${openFileBlock}` : `${TOOL_SYSTEM_PROMPT}${openFileBlock}`)
       : plainSystem
 
+    // Read on every turn so edits to the instructions apply immediately.
+    const instructions = await readProjectInstructions(rootDirHandle)
+    const systemWithInstructions = instructions
+      ? `${systemMsg}\n\nProject instructions (AGENTS.md):\n${instructions}`
+      : systemMsg
+
+    const sessionKey = rootDirName || sessionProject || SESSION_KEY_FALLBACK
+    let finalTranscript = transcript
+    let finalMessages = baseMessages
+    let status: 'idle' | 'interrupted' = 'interrupted'
+
+    // Persist before generating so a reload mid-turn can resume this prompt.
+    await writeStoredSession({
+      version: 1,
+      projectName: sessionKey,
+      updatedAt: Date.now(),
+      status: 'running',
+      uiMessages: baseMessages,
+      agentMessages: transcript,
+    })
+
     try {
       let full = ''
-      for await (const chunk of streamChat(chatMsgs, systemMsg, tools, abortController.signal)) {
+      for await (const chunk of streamChat(transcript, systemWithInstructions, tools, abortController.signal, next => {
+        finalTranscript = next
+        setAgentTranscript(next)
+      })) {
         if (abortRef.current) break
         if (chunk.tool?.ok) {
           const { name, path, from } = chunk.tool
@@ -2666,34 +2943,66 @@ function App() {
         const bl = parseCodeBlocks(full)
         if (bl.length) setCodeBlocks(bl)
       }
-      if (!abortRef.current) {
+      if (abortRef.current) {
+        setInterrupted(true)
+      } else {
         if (!full.trim()) {
           full = `The model returned an empty response. Build ${APP_BUILD}. Open DevTools and check for [pi-structured] diagnostics.`
         }
-        setMessages((prev: Message[]) => [...prev, { role: 'assistant', content: full }])
+        finalMessages = [...baseMessages, { role: 'assistant', content: full }]
+        setMessages(finalMessages)
         setStreamingContent('')
         setCodeBlocks(parseCodeBlocks(full))
+        status = 'idle'
+        setInterrupted(false)
       }
     } catch (err) {
       console.error('Generation error:', err)
       let detail = (err as Error).message || (err as Error).toString() || 'Generation failed'
       if (selectedProvider === PROVIDERS.BROWSER_AI) {
         try {
-          const status = await getBrowserAIStatus()
-          if (status.status !== 'available' && status.status !== 'needs-download') detail = status.message
+          const aiStatus = await getBrowserAIStatus()
+          if (aiStatus.status !== 'available' && aiStatus.status !== 'needs-download') detail = aiStatus.message
         } catch {}
       }
-      setMessages((prev: Message[]) => [...prev, { role: 'assistant', content: `Error: ${detail}` }])
+      finalMessages = [...baseMessages, { role: 'assistant', content: `Error: ${detail}` }]
+      setMessages(finalMessages)
+      const tail = finalTranscript[finalTranscript.length - 1]
+      const resumable = !!tail && (tail.role === 'user' || tail.role === 'toolResult')
+      status = resumable ? 'interrupted' : 'idle'
+      setInterrupted(resumable)
     } finally {
       generatingRef.current = false
       setIsGenerating(false)
       setStreamingContent('')
       setGenerationStatus('')
+      const persisted = await writeStoredSession({
+        version: 1,
+        projectName: sessionKey,
+        updatedAt: Date.now(),
+        status,
+        uiMessages: finalMessages,
+        agentMessages: finalTranscript,
+      })
+      if (!persisted) addNotification('Could not save this session locally.', 'error')
     }
-  }, [messages, modelLoaded, currentModel, attachContext, treeData, selectedProvider, selectedFile, refreshTree])
+  }, [messages, agentTranscript, modelLoaded, currentModel, attachContext, treeData, selectedProvider, selectedFile, refreshTree, sessionProject])
+
+  const handleSend = useCallback((text: string) => { void runTurn(text) }, [runTurn])
+  const handleResume = useCallback(() => {
+    if (!modelLoaded || isGenerating || !treeData) return
+    void runTurn(null)
+  }, [modelLoaded, isGenerating, treeData, runTurn])
 
   const handleStop = useCallback(() => { abortRef.current = true; stopGeneration() }, [])
-  const handleClear = useCallback(() => { setMessages([]); setStreamingContent(''); setCodeBlocks([]); saveState({ messages: [] }) }, [])
+  const handleClear = useCallback(async () => {
+    setMessages([])
+    setStreamingContent('')
+    setCodeBlocks([])
+    setAgentTranscript([])
+    setInterrupted(false)
+    await clearStoredSession(rootDirName || sessionProject || SESSION_KEY_FALLBACK)
+  }, [sessionProject])
   const consumeChatDraft = useCallback(() => setChatDraft(''), [])
 
   useEffect(() => {
@@ -2779,6 +3088,26 @@ function App() {
     } finally { setModelLoading(false) }
   }, [selectedModel, selectedProvider, customModelUrl])
 
+  /**
+   * Reload silently restores the Chrome model when it is already cached, so an
+   * offline launch needs no click. A model that still needs downloading is left
+   * to the explicit Load model button.
+   */
+  const autoLoadTried = useRef(false)
+  useEffect(() => {
+    if (autoLoadTried.current || modelLoaded || modelLoading) return
+    if (selectedProvider !== PROVIDERS.BROWSER_AI || !window.__browserAiAvailable || !selectedModel) return
+    autoLoadTried.current = true
+    void (async () => {
+      try {
+        const availability = await getBrowserAIStatus()
+        if (availability.status === 'available') await handleLoadModel()
+      } catch (err) {
+        console.warn('[coder] automatic Chrome model load failed', err)
+      }
+    })()
+  }, [selectedProvider, selectedModel, modelLoaded, modelLoading, handleLoadModel])
+
   const handleProviderChange = useCallback((p: Provider) => {
     if (p === PROVIDERS.BROWSER_AI && !window.__browserAiAvailable) return
     setSelectedProvider(p)
@@ -2796,7 +3125,7 @@ function App() {
 
   const sidebarProps: SidebarProps = { treeData, indexedCount, expandedPaths, onToggleDir: handleToggleDir, onFileClick: handleFileClick, selectedFile, onOpenFolder: handleOpenFolder, restorableProject, onRestoreProject: handleRestoreProject, recentCommits, onRefreshCommits: handleRefreshCommits }
 
-  const chatProps: ChatPanelProps = { messages, streamingContent, codeBlocks, isGenerating, generationStatus, onSend: handleSend, onStop: handleStop, onApply: handleApply, onClear: handleClear, onExport: handleExportChat, modelLoaded, modelList, selectedModel, onModelChange: handleModelChange, modelLoading, initProgress, onLoadModel: handleLoadModel, attachContext, onAttachContextChange: setAttachContext, customModelUrl, onCustomModel: setCustomModelUrl, selectedProvider, onProviderChange: handleProviderChange, onShowBuiltInAI: () => setShowBuiltInAI(true), projectOpen: !!treeData, draft: chatDraft, onDraftConsumed: consumeChatDraft }
+  const chatProps: ChatPanelProps = { messages, streamingContent, codeBlocks, isGenerating, generationStatus, onSend: handleSend, onStop: handleStop, onApply: handleApply, onClear: handleClear, onExport: handleExportChat, modelLoaded, modelList, selectedModel, onModelChange: handleModelChange, modelLoading, initProgress, onLoadModel: handleLoadModel, attachContext, onAttachContextChange: setAttachContext, customModelUrl, onCustomModel: setCustomModelUrl, selectedProvider, onProviderChange: handleProviderChange, onShowBuiltInAI: () => setShowBuiltInAI(true), projectOpen: !!treeData, draft: chatDraft, onDraftConsumed: consumeChatDraft, interrupted, onResume: handleResume }
   const quickFiles = useMemo(() => quickOpen ? [...fileHandles.keys()].sort() : [], [quickOpen, indexedCount])
   const modelLabel = modelList.find(m => m.id === selectedModel)?.label || selectedModel
 

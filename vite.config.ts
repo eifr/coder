@@ -54,6 +54,8 @@ export default defineConfig({
       ]
     },
     workbox: {
+      // Serve the precached shell for navigations so an offline reload works.
+      navigateFallback: 'index.html',
       globPatterns: ['**/*.{js,css,html,svg,png}'],
       maximumFileSizeToCacheInBytes: 15 * 1024 * 1024,
       globIgnores: ['**/ort-wasm-simd-threaded*.wasm', '**/*.wasm*'],
