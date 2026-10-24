@@ -97,6 +97,8 @@ declare global {
 }
 
 const STORAGE_KEY = 'coder-state'
+// Bump this when debugging a stale PWA/dev bundle; shown in the Model tab.
+const APP_BUILD = 'chrome-fallback-7d36104+1'
 
 interface PersistedState {
   selectedProvider: Provider
@@ -1066,6 +1068,7 @@ async function* streamPiAgent(
 async function* streamChat(messages: ModelMessage[], system?: string, tools?: HarnessTool[], signal?: AbortSignal): AsyncGenerator<ChatChunk> {
   if (!currentModel) throw new Error('Model not initialized')
   const provider = (currentModel as any).provider || PROVIDERS.WEBLLM
+  console.info('[coder] streamChat', APP_BUILD, provider)
 
   if (provider === PROVIDERS.BROWSER_AI) {
     const model = CHROME_MODEL.getModel(PROVIDER_ID, MODEL_ID)
@@ -1598,6 +1601,7 @@ function ChatPanel({ messages, streamingContent, codeBlocks, isGenerating, gener
             <span>Attach project context</span>
           </label>
           <p class="text-[10px] text-faint leading-relaxed">With context attached, the assistant can read and edit files with tools. Models stay on this device.</p>
+          <p class="text-[9px] text-faint font-mono">Build ${APP_BUILD}</p>
         </div>
       `}
     </div>
@@ -2648,7 +2652,7 @@ function App() {
       }
       if (!abortRef.current) {
         if (!full.trim()) {
-          full = 'The model returned an empty response. Try asking again, or switch to WebLLM for larger models.'
+          full = `The model returned an empty response. Build ${APP_BUILD}. Open DevTools and check for [pi-structured] diagnostics.`
         }
         setMessages((prev: Message[]) => [...prev, { role: 'assistant', content: full }])
         setStreamingContent('')
@@ -2938,6 +2942,9 @@ window.addEventListener('unhandledrejection', (event) => {
 window.addEventListener('error', (event) => {
   if (event.message) addNotification(`UI error: ${event.message}`, 'error')
 })
+
+console.info('[coder] build', APP_BUILD)
+;(window as any).__coderBuild = APP_BUILD
 
 checkAvailability().then(() => {
   const root = document.getElementById('root')
