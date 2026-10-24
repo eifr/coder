@@ -98,7 +98,7 @@ declare global {
 
 const STORAGE_KEY = 'coder-state'
 // Bump this when debugging a stale PWA/dev bundle; shown in the Model tab.
-const APP_BUILD = 'offline-session-7'
+const APP_BUILD = 'offline-session-8'
 
 interface PersistedState {
   selectedProvider: Provider

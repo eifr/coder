@@ -192,6 +192,19 @@ export function buildTextSchema(): Record<string, unknown> {
 }
 
 /**
+ * Messages belonging to the turn in progress: everything after the last user
+ * prompt. The stored transcript spans many turns, so loop guards must not see
+ * tool calls from earlier ones — otherwise one repeat anywhere in the session
+ * permanently forces text-only answers.
+ */
+export function currentTurnMessages(messages: TranscriptMessage[]): TranscriptMessage[] {
+  for (let index = messages.length - 1; index >= 0; index--) {
+    if (messages[index].role === 'user') return messages.slice(index)
+  }
+  return messages
+}
+
+/**
  * True when the model repeated the exact same tool call back to back. Current
  * on-device models can get stuck in that loop instead of answering.
  */
@@ -240,29 +253,61 @@ export function buildToolSchema(tools: Tool[]): Record<string, unknown> {
   }
 }
 
-export function parseStructuredToolCall(raw: string, tools: Tool[]): StructuredToolCall | undefined {
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(raw)
-  } catch {
-    return undefined
+/**
+ * The JSON object a model meant to send. On-device models ignore
+ * `responseConstraint` often enough to wrap the object in a markdown fence or
+ * a sentence; a bare `JSON.parse` then drops the call and the raw JSON ends up
+ * in the chat as if it were an answer.
+ */
+export function parseModelObject(raw: string): unknown {
+  const trimmed = raw.trim()
+  if (!trimmed) return undefined
+  const attempts: string[] = [trimmed]
+  const fenced = trimmed.match(/```(?:json|JSON)?\s*([\s\S]*?)```/)
+  if (fenced) attempts.push(fenced[1].trim())
+  const start = trimmed.indexOf('{')
+  const end = trimmed.lastIndexOf('}')
+  if (start >= 0 && end > start) {
+    const slice = trimmed.slice(start, end + 1)
+    attempts.push(slice)
+    // A trailing comma before a closing bracket is the other common slip.
+    attempts.push(slice.replace(/,\s*([}\]])/g, '$1'))
   }
+  for (const attempt of attempts) {
+    try {
+      return JSON.parse(attempt)
+    } catch {
+      // Try the next shape.
+    }
+  }
+  return undefined
+}
+
+/** Tool arguments arrive as an object, or (sometimes) as a JSON string. */
+function toolArguments(value: unknown): JsonObject | undefined {
+  if (typeof value === 'string') {
+    const parsed = parseModelObject(value)
+    return parsed && typeof parsed === 'object' ? parsed as JsonObject : undefined
+  }
+  return value && typeof value === 'object' ? value as JsonObject : undefined
+}
+
+export function parseStructuredToolCall(raw: string, tools: Tool[]): StructuredToolCall | undefined {
+  const parsed = parseModelObject(raw)
   if (!parsed || typeof parsed !== 'object') return undefined
   if (!('tool' in parsed) || typeof parsed.tool !== 'string') return undefined
   if (!tools.some(tool => tool.name === parsed.tool)) return undefined
-  if (!('arguments' in parsed) || !parsed.arguments || typeof parsed.arguments !== 'object') return undefined
+  if (!('arguments' in parsed)) return undefined
+  const args = toolArguments((parsed as { arguments?: unknown }).arguments)
+  if (!args) return undefined
   // responseConstraint validated the arguments against the tool's JSON Schema.
-  return { tool: parsed.tool, arguments: parsed.arguments as JsonObject }
+  return { tool: parsed.tool, arguments: args }
 }
 
 export function structuredText(raw: string): string | undefined {
-  try {
-    const parsed: unknown = JSON.parse(raw)
-    if (parsed && typeof parsed === 'object' && 'text' in parsed && typeof parsed.text === 'string') {
-      return parsed.text
-    }
-  } catch {
-    // Fall through to the raw response.
+  const parsed = parseModelObject(raw)
+  if (parsed && typeof parsed === 'object' && 'text' in parsed && typeof parsed.text === 'string') {
+    return parsed.text
   }
   return undefined
 }
@@ -397,6 +442,9 @@ export async function consumeStructuredStream(
       return
     }
     const answer = structuredText(raw) ?? raw
+    if (!forceText && /"tool"/.test(raw)) {
+      console.warn('[pi-structured] rejected tool-call payload', raw.slice(0, 300))
+    }
     if (answer) {
       textIndex = message.content.length
       message.content.push({ type: 'text', text: answer })
@@ -459,8 +507,9 @@ function streamSimple(
       const last = all[all.length - 1]
       if (!last) throw new Error('Chrome provider received an empty transcript.')
       const history = all.slice(0, -1).filter(item => item.role !== 'system')
-      const repeated = hasRepeatedToolCall(context.messages)
-      const toolCallCount = countToolCalls(context.messages)
+      const turn = currentTurnMessages(context.messages as TranscriptMessage[])
+      const repeated = hasRepeatedToolCall(turn)
+      const toolCallCount = countToolCalls(turn)
       // pi's agent stops at 8 turns; force an answer before that so a model
       // that keeps calling tools still produces a summary.
       const forceText = tools.length > 0 && last.role === 'toolResult' && (repeated || toolCallCount >= 6)

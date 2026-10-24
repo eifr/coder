@@ -17,6 +17,7 @@ import {
   buildToolPrompt,
   consumeStructuredStream,
   countToolCalls,
+  currentTurnMessages,
   hasRepeatedToolCall,
   isContextOverflow,
   toPlainMessage,
@@ -66,8 +67,9 @@ function streamLocal(
       const last = all[all.length - 1]
       if (!last) throw new Error('Local provider received an empty transcript.')
       const history = all.slice(0, -1).filter(item => item.role !== 'system')
-      const repeated = hasRepeatedToolCall(context.messages)
-      const toolCallCount = countToolCalls(context.messages)
+      const turn = currentTurnMessages(all)
+      const repeated = hasRepeatedToolCall(turn)
+      const toolCallCount = countToolCalls(turn)
       const forceText = tools.length > 0 && last.role === 'toolResult' && (repeated || toolCallCount >= MAX_AGENT_TOOL_CALLS)
       if (forceText) {
         console.warn(`[pi-local] forcing a text-only answer (${toolCallCount} tool calls, repeated=${repeated}).`)
