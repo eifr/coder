@@ -19,6 +19,8 @@ const CHROME_API = 'chrome-prompt-api'
 const PROVIDER_ID = 'chrome-ai'
 const MODEL_ID = 'gemini-nano'
 const DEFAULT_CONTEXT_WINDOW = 9216
+const SUPPORTED_LANGUAGES = ['en', 'ja', 'es', 'de', 'fr']
+const MINIMAL_SYSTEM = 'You are Coder, a helpful coding assistant. Answer the user directly and concisely.'
 
 interface PromptStreamOptions {
   signal?: AbortSignal
@@ -29,6 +31,7 @@ interface PromptSession {
   readonly contextUsage?: number
   readonly contextWindow?: number
   promptStreaming(input: unknown, options?: PromptStreamOptions): AsyncIterable<unknown>
+  prompt?(input: unknown, options?: PromptStreamOptions): Promise<unknown>
   destroy?: () => void
 }
 
@@ -108,6 +111,16 @@ export function chunkText(chunk: unknown): string | undefined {
 export function isContextOverflow(error: unknown): boolean {
   if (!(error instanceof Error)) return false
   return error.name === 'QuotaExceededError' || /context|too large|quota/i.test(error.message)
+}
+
+/** Non-streaming prompt() fallback: string or LanguageModelMessageContent[]. */
+function promptResultText(result: unknown): string | undefined {
+  if (typeof result === 'string') return result
+  if (Array.isArray(result)) {
+    const text = result.map(part => chunkText(part) ?? '').join('')
+    return text || undefined
+  }
+  return chunkText(result)
 }
 
 /**
@@ -272,8 +285,8 @@ async function createSession(
 
   const options: Record<string, unknown> = {
     initialPrompts,
-    expectedInputs: [{ type: 'text' }],
-    expectedOutputs: [{ type: 'text' }],
+    expectedInputs: [{ type: 'text', languages: SUPPORTED_LANGUAGES }],
+    expectedOutputs: [{ type: 'text', languages: SUPPORTED_LANGUAGES }],
   }
   if (signal) options.signal = signal
   return languageModel.create(options)
@@ -453,7 +466,8 @@ function streamSimple(
       session = await createSession(languageModel, system, history, tools, signal, forceText)
       const inputTokens = session.contextUsage ?? 0
       const structured = tools.length > 0
-      const promptInput = [toPlainMessage(last)]
+      const nativeLast = toPlainMessage(last)
+      const promptInput = last.role === 'user' ? nativeLast.content : [nativeLast]
       const promptOptions: PromptStreamOptions = {}
       if (signal) promptOptions.signal = signal
       if (structured) {
@@ -464,13 +478,36 @@ function streamSimple(
 
       await consumeStructuredStream(session.promptStreaming(promptInput, promptOptions), tools, message, stream, signal, forceText)
 
-      // Some Chrome builds ignore responseConstraint and return no text at all.
-      // Retry once as a plain text session so the user still gets an answer.
-      if (structured && message.content.length === 0 && !signal?.aborted) {
-        console.warn('[pi-chrome] structured response was empty; retrying as plain text.')
+      // Some builds return an empty stream but still answer through prompt().
+      if (message.content.length === 0 && !signal?.aborted && session.prompt) {
+        try {
+          const result = await session.prompt(promptInput, promptOptions)
+          const resultText = promptResultText(result)
+          if (resultText) {
+            console.warn('[pi-chrome] streaming was empty; using prompt() fallback.')
+            await consumeStructuredStream(
+              (async function* () { yield resultText })(),
+              tools,
+              message,
+              stream,
+              signal,
+              forceText
+            )
+          }
+        } catch (error) {
+          console.warn('[pi-chrome] prompt() fallback failed', error)
+        }
+      }
+
+      let usageInput = inputTokens
+      // Some Chrome builds ignore responseConstraint or the system prompt and
+      // return no text at all. Retry plain, then with a minimal system prompt.
+      if (message.content.length === 0 && !signal?.aborted) {
+        console.warn('[pi-chrome] response was empty; retrying as plain text.')
         session.destroy?.()
-        session = await createSession(languageModel, system, history, [], signal, false)
-        const retryInput = session.contextUsage ?? 0
+        const retrySystem = structured ? system : MINIMAL_SYSTEM
+        session = await createSession(languageModel, retrySystem, history, [], signal, false)
+        usageInput = session.contextUsage ?? 0
         await consumeStructuredStream(
           session.promptStreaming(promptInput, signal ? { signal } : undefined),
           [],
@@ -479,23 +516,28 @@ function streamSimple(
           signal,
           false
         )
-        const afterRetry = session.contextUsage ?? retryInput
-        const outputTokens = Math.max(0, afterRetry - retryInput)
-        message.usage = {
-          ...zeroUsage(),
-          input: retryInput,
-          output: outputTokens,
-          totalTokens: retryInput + outputTokens,
+        if (message.content.length === 0 && structured && !signal?.aborted) {
+          console.warn('[pi-chrome] plain retry was empty; retrying with a minimal system prompt.')
+          session.destroy?.()
+          session = await createSession(languageModel, MINIMAL_SYSTEM, history, [], signal, false)
+          usageInput = session.contextUsage ?? 0
+          await consumeStructuredStream(
+            session.promptStreaming(promptInput, signal ? { signal } : undefined),
+            [],
+            message,
+            stream,
+            signal,
+            false
+          )
         }
-      } else {
-        const after = session.contextUsage ?? inputTokens
-        const outputTokens = Math.max(0, after - inputTokens)
-        message.usage = {
-          ...zeroUsage(),
-          input: inputTokens,
-          output: outputTokens,
-          totalTokens: inputTokens + outputTokens,
-        }
+      }
+      const after = session.contextUsage ?? usageInput
+      const outputTokens = Math.max(0, after - usageInput)
+      message.usage = {
+        ...zeroUsage(),
+        input: usageInput,
+        output: outputTokens,
+        totalTokens: usageInput + outputTokens,
       }
       message.stopReason = message.content.some(block => block.type === 'toolCall') ? 'toolUse' : 'stop'
       stream.push({ type: 'done', reason: message.stopReason, message })
