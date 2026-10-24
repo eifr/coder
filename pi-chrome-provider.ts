@@ -152,7 +152,7 @@ function toPlainMessage(message: TranscriptMessage): unknown {
   }
 }
 
-function buildToolPrompt(system: string, tools: Tool[]): string {
+function buildToolPrompt(system: string, tools: Tool[], forceText = false): string {
   const declarations = tools.map(tool => [
     `- ${tool.name}: ${tool.description}`,
     `  arguments: ${JSON.stringify(tool.parameters)}`,
@@ -161,11 +161,50 @@ function buildToolPrompt(system: string, tools: Tool[]): string {
     system,
     'You can call tools. Reply with exactly one JSON object and no markdown:',
     '{"tool":"<name>","arguments":{...}} to call a tool, or {"text":"<answer>"} to answer.',
+    'Call a tool only when the request needs project files or an edit. For greetings, explanations, or questions you can answer directly, use {"text":"<answer>"} and do not call a tool.',
     'After a tool result, answer with {"text":"<answer>"} and do not call that tool again.',
     'Omit optional arguments you do not need; never send empty strings or the text "undefined".',
+    forceText ? 'The previous tool call already ran. You must answer with {"text":"<answer>"} now; no more tools are available this turn.' : '',
     'Tools:',
     declarations,
   ].filter(Boolean).join('\n')
+}
+
+function buildTextSchema(): Record<string, unknown> {
+  return {
+    type: 'object',
+    properties: { text: { type: 'string' } },
+    required: ['text'],
+  }
+}
+
+/**
+ * True when the model repeated the exact same tool call back to back. Current
+ * on-device models can get stuck in that loop instead of answering.
+ */
+function hasRepeatedToolCall(messages: TranscriptMessage[]): boolean {
+  let previous: string | undefined
+  for (const message of messages) {
+    if (message.role !== 'assistant') continue
+    for (const block of message.content) {
+      if (block.type !== 'toolCall') continue
+      const key = `${block.name}\u0000${JSON.stringify(block.arguments)}`
+      if (key === previous) return true
+      previous = key
+    }
+  }
+  return false
+}
+
+function countToolCalls(messages: TranscriptMessage[]): number {
+  let count = 0
+  for (const message of messages) {
+    if (message.role !== 'assistant') continue
+    for (const block of message.content) {
+      if (block.type === 'toolCall') count++
+    }
+  }
+  return count
 }
 
 function buildToolSchema(tools: Tool[]): Record<string, unknown> {
@@ -220,10 +259,11 @@ async function createSession(
   system: string,
   history: TranscriptMessage[],
   tools: Tool[],
-  signal: AbortSignal | undefined
+  signal: AbortSignal | undefined,
+  forceText: boolean
 ): Promise<PromptSession> {
   const initialPrompts: unknown[] = []
-  const prompt = tools.length > 0 ? buildToolPrompt(system, tools) : system
+  const prompt = tools.length > 0 ? buildToolPrompt(system, tools, forceText) : system
   if (prompt) initialPrompts.push({ role: 'system', content: prompt })
   initialPrompts.push(...history.map(toPlainMessage))
 
@@ -273,14 +313,24 @@ function streamSimple(
       const last = all[all.length - 1]
       if (!last) throw new Error('Chrome provider received an empty transcript.')
       const history = all.slice(0, -1).filter(item => item.role !== 'system')
+      const repeated = hasRepeatedToolCall(context.messages)
+      const toolCallCount = countToolCalls(context.messages)
+      // pi's agent stops at 8 turns; force an answer before that so a model
+      // that keeps calling tools still produces a summary.
+      const forceText = tools.length > 0 && last.role === 'toolResult' && (repeated || toolCallCount >= 6)
+      if (forceText) {
+        console.warn(`[pi-chrome] forcing a text-only answer (${toolCallCount} tool calls, repeated=${repeated}).`)
+      }
 
-      session = await createSession(languageModel, system, history, tools, signal)
+      session = await createSession(languageModel, system, history, tools, signal, forceText)
       const inputTokens = session.contextUsage ?? 0
       const structured = tools.length > 0
       const promptInput = [toPlainMessage(last)]
       const promptOptions: PromptStreamOptions = {}
       if (signal) promptOptions.signal = signal
-      if (structured) promptOptions.responseConstraint = buildToolSchema(tools)
+      if (structured) {
+        promptOptions.responseConstraint = forceText ? buildTextSchema() : buildToolSchema(tools)
+      }
 
       stream.push({ type: 'start', partial: { ...message } })
 
@@ -369,6 +419,8 @@ function streamSimple(
             stream.push({ type: 'text_start', contentIndex: textIndex, partial: { ...message } })
             stream.push({ type: 'text_delta', contentIndex: textIndex, delta: answer, partial: { ...message } })
             stream.push({ type: 'text_end', contentIndex: textIndex, content: answer, partial: { ...message } })
+          } else {
+            console.warn('[pi-chrome] model returned an empty structured response.', raw)
           }
         }
       } else if (textIndex >= 0) {

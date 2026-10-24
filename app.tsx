@@ -1,6 +1,7 @@
 import { html, render, Component, useState, useEffect, useRef, useCallback, useMemo } from 'htm/preact/standalone.mjs'
 import { PROVIDERS, getAvailableModels, estimateVRAM, getPreferredModel, checkProviderAvailability, getBrowserAIStatus, getBuiltInAICapabilities, getProviderLabel, initProviderModel, createChatStream, createTools, type Provider, type ModelDescriptor, type BuiltInApiInfo, type BuiltInApiStatus } from './llm-provider'
 import { createHarnessTools, type HarnessTool } from './chrome-harness'
+import { readRecentCommits, type RecentCommit } from './git-log'
 import { Agent, type AgentMessage, type AgentTool } from '@earendil-works/pi-agent-core'
 import { Type } from '@earendil-works/pi-ai'
 import { CHROME_API, MODEL_ID, PROVIDER_ID, createChromeModels } from './pi-chrome-provider'
@@ -293,6 +294,7 @@ let modelLoadPromise: Promise<LanguageModel> | null = null
 let onFileSaved: ((path: string) => void) | null = null
 let onFileOpened: ((path: string) => void) | null = null
 let onFileDirtyChanged: ((path: string, dirty: boolean) => void) | null = null
+let onRecentCommits: ((commits: RecentCommit[]) => void) | null = null
 const savedContents = new Map<string, string>()
 
 interface EditorRange {
@@ -541,6 +543,10 @@ async function activateFolder(
   const entries = await readDirEntries(handle)
   if (generation !== folderGeneration) return null
   indexPromise = indexFolder(handle, generation, onIndexProgress)
+  onRecentCommits?.([])
+  void readRecentCommits(handle).then(commits => {
+    if (generation === folderGeneration) onRecentCommits?.(commits)
+  })
   return entries
 }
 
@@ -914,6 +920,7 @@ async function* streamChromeAgent(
   let visible = ''
   let toolCalls = 0
   let turns = 0
+  let lastToolResult = ''
   let finished = false
   let cleaned = false
   let failure: Error | null = null
@@ -961,6 +968,9 @@ async function* streamChromeAgent(
     }
     if (event.type === 'tool_execution_end') {
       const path = toolPaths.get(event.toolCallId)
+      lastToolResult = event.result.content
+        .map((part: { type: string; text?: string }) => part.type === 'text' ? part.text ?? '' : '')
+        .join('')
       console.log('Tool result:', event.toolName, event.isError ? 'error' : 'ok')
       queue.push({
         text: visible,
@@ -985,8 +995,11 @@ async function* streamChromeAgent(
     failure = error instanceof Error ? error : new Error(String(error))
   }).finally(() => {
     finished = true
+    const resultPreview = lastToolResult.length > 1200
+      ? `${lastToolResult.slice(0, 1200)}\n…[truncated]`
+      : lastToolResult
     const fallback = toolCalls > 0
-      ? `Completed ${toolCalls} tool call${toolCalls === 1 ? '' : 's'} but the model returned no summary.`
+      ? `The model completed ${toolCalls} tool call${toolCalls === 1 ? '' : 's'} without a final summary.${resultPreview ? `\n\nLast tool result:\n${resultPreview}` : ''}`
       : ''
     queue.push({ text: visible || fallback, done: true, delta: '', usage: null })
     queue.close()
@@ -1241,9 +1254,11 @@ interface SidebarProps {
   restorableProject: string | null
   onRestoreProject: () => void
   onShowBuiltInAI: () => void
+  recentCommits: RecentCommit[]
+  onRefreshCommits: () => void
 }
 
-function Sidebar({ treeData, indexedCount, expandedPaths, onToggleDir, onFileClick, selectedFile, modelList, selectedModel, onModelChange, modelLoaded, modelLoading, initProgress, onLoadModel, onOpenFolder, attachContext, onAttachContextChange, customModelUrl, onCustomModel, selectedProvider, onProviderChange, modelAreaHidden, onToggleModelArea, restorableProject, onRestoreProject, onShowBuiltInAI }: SidebarProps) {
+function Sidebar({ treeData, indexedCount, expandedPaths, onToggleDir, onFileClick, selectedFile, modelList, selectedModel, onModelChange, modelLoaded, modelLoading, initProgress, onLoadModel, onOpenFolder, attachContext, onAttachContextChange, customModelUrl, onCustomModel, selectedProvider, onProviderChange, modelAreaHidden, onToggleModelArea, restorableProject, onRestoreProject, onShowBuiltInAI, recentCommits, onRefreshCommits }: SidebarProps) {
   const visibleCount = useMemo(() => {
     if (!treeData) return 0
     let n = 0
@@ -1279,6 +1294,22 @@ function Sidebar({ treeData, indexedCount, expandedPaths, onToggleDir, onFileCli
             <p class="mt-2.5 text-[11.5px] text-muted">No folder open</p>
             <p class="mt-1 text-[10.5px] leading-relaxed text-faint">Files are read locally and never uploaded.</p>
           </div>`}
+        ${recentCommits.length > 0 ? html`
+          <div class="mt-2 border-t border-line pt-2">
+            <div class="px-3 flex items-center justify-between">
+              <span class="text-[10px] font-semibold uppercase tracking-[0.16em] text-faint">Recent changes</span>
+              <button class="text-[10px] text-faint hover:text-ink transition-colors" onClick=${onRefreshCommits} title="Re-read .git/logs/HEAD">Refresh</button>
+            </div>
+            <ul class="mt-1 px-3 pb-2 space-y-1">
+              ${recentCommits.map(commit => html`
+                <li key=${`${commit.hash}:${commit.message}`} class="flex items-baseline gap-1.5 text-[10.5px] leading-snug" title=${commit.message}>
+                  ${commit.hash ? html`<span class="font-mono text-[9.5px] text-faint shrink-0">${commit.hash}</span>` : ''}
+                  <span class="text-muted truncate">${commit.message}</span>
+                </li>
+              `)}
+            </ul>
+          </div>
+        ` : ''}
       </div>
       <div class="p-3 border-t border-line space-y-2.5">
         <div class="flex items-center justify-between">
@@ -2111,6 +2142,7 @@ function App() {
   const [treeData, setTreeData] = useState<FileEntry[] | null>(null)
   const [restorableProject, setRestorableProject] = useState<string | null>(null)
   const [indexedCount, setIndexedCount] = useState(0)
+  const [recentCommits, setRecentCommits] = useState<RecentCommit[]>([])
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(new Set())
   const [selectedFile, setSelectedFile] = useState<string | null>(null)
   const [selectedProvider, setSelectedProvider] = useState<Provider>((saved.selectedProvider as Provider) || PROVIDERS.WEBLLM)
@@ -2151,6 +2183,11 @@ function App() {
   useEffect(() => {
     onFileSaved = (path) => setSavedFile(path)
     return () => { onFileSaved = null }
+  }, [])
+
+  useEffect(() => {
+    onRecentCommits = setRecentCommits
+    return () => { onRecentCommits = null }
   }, [])
 
   useEffect(() => {
@@ -2299,6 +2336,14 @@ function App() {
     const entries = await openFolder(setIndexedCount)
     if (entries) applyFolder(entries)
   }, [dirtyFiles, applyFolder])
+
+  const handleRefreshCommits = useCallback(async () => {
+    if (!rootDirHandle) {
+      setRecentCommits([])
+      return
+    }
+    setRecentCommits(await readRecentCommits(rootDirHandle))
+  }, [])
 
   // Restore the last project without a picker. Reloads keep an already granted
   // permission; after a browser restart Chrome reports "prompt", which needs a
@@ -2629,7 +2674,7 @@ function App() {
     } finally { setModelLoading(false) }
   }, [selectedModel, selectedProvider, customModelUrl])
 
-  const sidebarProps: SidebarProps = { treeData, indexedCount, expandedPaths, onToggleDir: handleToggleDir, onFileClick: handleFileClick, selectedFile, modelList, selectedModel, onModelChange: m => { setSelectedModel(m); setModelLoaded(false) }, modelLoaded, modelLoading, initProgress, onLoadModel: handleLoadModel, onOpenFolder: handleOpenFolder, attachContext, onAttachContextChange: setAttachContext, customModelUrl, onCustomModel: setCustomModelUrl, selectedProvider, onProviderChange: p => { if (p === PROVIDERS.BROWSER_AI && !window.__browserAiAvailable) return; setSelectedProvider(p); setSelectedModel(''); setModelLoaded(false); const models = getAvailableModels(4096); const first = models.find(m => m.provider === p); if (first) setSelectedModel(first.id) }, modelAreaHidden, onToggleModelArea: () => setModelAreaHidden(v => !v), restorableProject, onRestoreProject: handleRestoreProject, onShowBuiltInAI: () => setShowBuiltInAI(true) }
+  const sidebarProps: SidebarProps = { treeData, indexedCount, expandedPaths, onToggleDir: handleToggleDir, onFileClick: handleFileClick, selectedFile, modelList, selectedModel, onModelChange: m => { setSelectedModel(m); setModelLoaded(false) }, modelLoaded, modelLoading, initProgress, onLoadModel: handleLoadModel, onOpenFolder: handleOpenFolder, attachContext, onAttachContextChange: setAttachContext, customModelUrl, onCustomModel: setCustomModelUrl, selectedProvider, onProviderChange: p => { if (p === PROVIDERS.BROWSER_AI && !window.__browserAiAvailable) return; setSelectedProvider(p); setSelectedModel(''); setModelLoaded(false); const models = getAvailableModels(4096); const first = models.find(m => m.provider === p); if (first) setSelectedModel(first.id) }, modelAreaHidden, onToggleModelArea: () => setModelAreaHidden(v => !v), restorableProject, onRestoreProject: handleRestoreProject, onShowBuiltInAI: () => setShowBuiltInAI(true), recentCommits, onRefreshCommits: handleRefreshCommits }
 
   const chatProps: ChatPanelProps = { messages, streamingContent, codeBlocks, isGenerating, generationStatus, onSend: handleSend, onStop: handleStop, onApply: handleApply, onClear: handleClear, onExport: handleExportChat, modelLoaded, draft: chatDraft, onDraftConsumed: consumeChatDraft }
   const quickFiles = useMemo(() => quickOpen ? [...fileHandles.keys()].sort() : [], [quickOpen, indexedCount])
