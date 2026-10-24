@@ -273,7 +273,8 @@ async function createSession(
   history: TranscriptMessage[],
   tools: Tool[],
   signal: AbortSignal | undefined,
-  forceText: boolean
+  forceText: boolean,
+  languages: string[] = SUPPORTED_LANGUAGES
 ): Promise<PromptSession> {
   const initialPrompts: unknown[] = []
   const prompt = tools.length > 0 ? buildToolPrompt(system, tools, forceText) : system
@@ -285,8 +286,8 @@ async function createSession(
 
   const options: Record<string, unknown> = {
     initialPrompts,
-    expectedInputs: [{ type: 'text', languages: SUPPORTED_LANGUAGES }],
-    expectedOutputs: [{ type: 'text', languages: SUPPORTED_LANGUAGES }],
+    expectedInputs: [{ type: 'text', ...(languages.length ? { languages } : {}) }],
+    expectedOutputs: [{ type: 'text', ...(languages.length ? { languages } : {}) }],
   }
   if (signal) options.signal = signal
   return languageModel.create(options)
@@ -447,7 +448,11 @@ function streamSimple(
     }
 
     let session: PromptSession | undefined
+    let retryReady = false
+    let retryHistory: TranscriptMessage[] = []
+    let retryPrompt: unknown = ''
     try {
+      stream.push({ type: 'start', partial: { ...message } })
       const system = getCurrentSystemPrompt(context.messages)
       const tools = getCurrentTools(context.messages)
       const all = context.messages as TranscriptMessage[]
@@ -463,18 +468,19 @@ function streamSimple(
         console.warn(`[pi-chrome] forcing a text-only answer (${toolCallCount} tool calls, repeated=${repeated}).`)
       }
 
-      session = await createSession(languageModel, system, history, tools, signal, forceText)
-      const inputTokens = session.contextUsage ?? 0
       const structured = tools.length > 0
       const nativeLast = toPlainMessage(last)
       const promptInput = last.role === 'user' ? nativeLast.content : [nativeLast]
+      retryReady = true
+      retryHistory = history
+      retryPrompt = promptInput
+      session = await createSession(languageModel, system, history, tools, signal, forceText)
+      const inputTokens = session.contextUsage ?? 0
       const promptOptions: PromptStreamOptions = {}
       if (signal) promptOptions.signal = signal
       if (structured) {
         promptOptions.responseConstraint = forceText ? buildTextSchema() : buildToolSchema(tools)
       }
-
-      stream.push({ type: 'start', partial: { ...message } })
 
       await consumeStructuredStream(session.promptStreaming(promptInput, promptOptions), tools, message, stream, signal, forceText)
 
@@ -543,10 +549,43 @@ function streamSimple(
       stream.push({ type: 'done', reason: message.stopReason, message })
       stream.end(message)
     } catch (error) {
+      if (retryReady && !signal?.aborted && message.content.length === 0) {
+        try {
+          console.warn('[pi-chrome] first attempt failed; retrying with a minimal plain session.', error)
+          session?.destroy?.()
+          session = await createSession(languageModel, MINIMAL_SYSTEM, retryHistory, [], signal, false, [])
+          const retryInput = session.contextUsage ?? 0
+          await consumeStructuredStream(
+            session.promptStreaming(retryPrompt, signal ? { signal } : undefined),
+            [],
+            message,
+            stream,
+            signal,
+            false
+          )
+          if (message.content.length > 0) {
+            const after = session.contextUsage ?? retryInput
+            const outputTokens = Math.max(0, after - retryInput)
+            message.usage = {
+              ...zeroUsage(),
+              input: retryInput,
+              output: outputTokens,
+              totalTokens: retryInput + outputTokens,
+            }
+            message.stopReason = 'stop'
+            stream.push({ type: 'done', reason: 'stop', message })
+            stream.end(message)
+            return
+          }
+        } catch (retryError) {
+          console.warn('[pi-chrome] minimal plain retry failed', retryError)
+        }
+      }
       const aborted = signal?.aborted || (error instanceof Error && error.name === 'AbortError')
       message.stopReason = aborted ? 'aborted' : 'error'
       const reason = error instanceof Error ? error.message : String(error)
       message.errorMessage = isContextOverflow(error) ? `context_length_exceeded: ${reason}` : reason
+      console.error('[pi-chrome] stream error', error)
       stream.push({ type: 'error', reason: message.stopReason, error: message })
       stream.end(message)
     } finally {

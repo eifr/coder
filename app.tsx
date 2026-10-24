@@ -98,7 +98,7 @@ declare global {
 
 const STORAGE_KEY = 'coder-state'
 // Bump this when debugging a stale PWA/dev bundle; shown in the Model tab.
-const APP_BUILD = 'chrome-fallback-7d36104+1'
+const APP_BUILD = 'chrome-fallback-3'
 
 interface PersistedState {
   selectedProvider: Provider
@@ -1047,9 +1047,13 @@ async function* streamPiAgent(
     const resultPreview = lastToolResult.length > 1200
       ? `${lastToolResult.slice(0, 1200)}\n…[truncated]`
       : lastToolResult
-    const fallback = toolCalls > 0
-      ? `The model completed ${toolCalls} tool call${toolCalls === 1 ? '' : 's'} without a final summary.${resultPreview ? `\n\nLast tool result:\n${resultPreview}` : ''}`
-      : ''
+    const agentError = agent.state.errorMessage
+    if (!visible && agentError) console.error('[coder] agent ended without content:', agentError)
+    const fallback = agentError
+      ? `Error: ${agentError}`
+      : toolCalls > 0
+        ? `The model completed ${toolCalls} tool call${toolCalls === 1 ? '' : 's'} without a final summary.${resultPreview ? `\n\nLast tool result:\n${resultPreview}` : ''}`
+        : ''
     queue.push({ text: visible || fallback, done: true, delta: '', usage: null })
     queue.close()
     cleanup()
