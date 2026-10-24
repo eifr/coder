@@ -1,6 +1,6 @@
 import { html, render, Component, useState, useEffect, useRef, useCallback, useMemo } from 'htm/preact/standalone.mjs'
 import { PROVIDERS, getAvailableModels, estimateVRAM, getPreferredModel, checkProviderAvailability, getBrowserAIStatus, getBuiltInAICapabilities, getProviderLabel, initProviderModel, createChatStream, createTools, type Provider, type ModelDescriptor, type BuiltInApiInfo, type BuiltInApiStatus } from './llm-provider'
-import { createHarnessTools, type HarnessTool } from './chrome-harness'
+import { createHarnessTools, type HarnessTool, type HarnessDiagnostic, type HarnessOpenFile, type HarnessSelection } from './chrome-harness'
 import { readRecentCommits, type RecentCommit } from './git-log'
 import { Agent, type AgentMessage, type AgentTool } from '@earendil-works/pi-agent-core'
 import { Type } from '@earendil-works/pi-ai'
@@ -258,7 +258,10 @@ const TOOL_SYSTEM_PROMPT = `${SYSTEM_PROMPT}
 
 You can inspect and modify the user's local project with tools:
 - listFiles / searchFiles: find files and symbols
+- findFiles: find files by glob pattern, e.g. src/**/*.ts
 - readFile: read a file (required before any edit)
+- getOpenFile / getSelection: read the open editor file or selected text
+- getDiagnostics: current editor errors and warnings
 - createFile: create a new file (fails if it already exists)
 - replaceInFile: replace one exact, unique snippet (preferred edit)
 - editFile: rewrite a whole file (last resort)
@@ -1169,6 +1172,45 @@ async function readFileForTool(path: string): Promise<string | null> {
     return await readFileContent(handle)
   } catch {
     return null
+  }
+}
+
+function collectEditorDiagnostics(): HarnessDiagnostic[] {
+  const diagnostics: HarnessDiagnostic[] = []
+  for (const [path, model] of monacoModels) {
+    for (const marker of monaco.editor.getModelMarkers({ resource: model.uri })) {
+      diagnostics.push({
+        path,
+        severity: marker.severity === monaco.MarkerSeverity.Error ? 'error'
+          : marker.severity === monaco.MarkerSeverity.Warning ? 'warning'
+          : marker.severity === monaco.MarkerSeverity.Info ? 'info'
+          : 'hint',
+        message: marker.message,
+        line: marker.startLineNumber,
+        column: marker.startColumn,
+      })
+    }
+  }
+  return diagnostics.slice(0, 200)
+}
+
+function readOpenFileForTool(): HarnessOpenFile | null {
+  if (!currentFilePath || !editor) return null
+  const model = editor.getModel()
+  if (!model) return null
+  return { path: currentFilePath, content: model.getValue() }
+}
+
+function readSelectionForTool(): HarnessSelection | null {
+  if (!editor) return null
+  const model = editor.getModel()
+  const selection = editor.getSelection()
+  if (!model || !selection) return null
+  return {
+    path: currentFilePath,
+    text: model.getValueInRange(selection),
+    startLine: selection.startLineNumber,
+    endLine: selection.endLineNumber,
   }
 }
 
@@ -2519,6 +2561,9 @@ function App() {
             writeFile: applyFileChanges,
             createFile: createFileForTool,
             deleteFile: deleteFileForTool,
+            getDiagnostics: collectEditorDiagnostics,
+            getOpenFile: readOpenFileForTool,
+            getSelection: readSelectionForTool,
           })
         : createTools(readFileForTool, applyFileChanges, createFileForTool, deleteFileForTool)
     }

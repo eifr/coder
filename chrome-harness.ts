@@ -373,6 +373,34 @@ export interface HarnessFs {
   /** Create a file, failing if it already exists. */
   createFile: (path: string, content: string) => Promise<boolean>
   deleteFile: (path: string) => Promise<boolean>
+  /** Current editor markers, including unsaved files. */
+  getDiagnostics?: () => HarnessDiagnostic[]
+  /** The file currently open in the editor, including unsaved changes. */
+  getOpenFile?: () => HarnessOpenFile | null
+  /** The current editor selection. */
+  getSelection?: () => HarnessSelection | null
+}
+
+export type HarnessSeverity = 'error' | 'warning' | 'info' | 'hint'
+
+export interface HarnessDiagnostic {
+  path: string
+  severity: HarnessSeverity
+  message: string
+  line: number
+  column: number
+}
+
+export interface HarnessOpenFile {
+  path: string
+  content: string
+}
+
+export interface HarnessSelection {
+  path: string | null
+  text: string
+  startLine: number
+  endLine: number
 }
 
 const MAX_READ_LINES = 600
@@ -381,6 +409,8 @@ const MAX_LISTED_FILES = 500
 const MAX_SEARCH_FILES = 400
 const MAX_SEARCH_BYTES = 2_000_000
 const MAX_SEARCH_MATCHES = 40
+const MAX_FIND_MATCHES = 200
+const MAX_EDITOR_TEXT = 16000
 
 function normalizePath(path: unknown): string {
   return String(path ?? '').replace(/\\/g, '/').replace(/^\.?\//, '').replace(/\/+$/, '')
@@ -413,6 +443,34 @@ function checkProjectPath(value: unknown): PathCheck {
     return { error: `Refusing to touch protected directories (${Object.keys(PROTECTED_DIRS).join(', ')}): ${raw}` }
   }
   return { path: segments.join('/') }
+}
+
+/** Minimal glob matcher: `*`, `**`, `?`, and literal path segments. */
+function globToRegExp(pattern: string): RegExp {
+  let source = '^'
+  for (let i = 0; i < pattern.length; i++) {
+    const char = pattern[i]
+    if (char === '*') {
+      if (pattern[i + 1] === '*') {
+        i++
+        if (pattern[i + 1] === '/') {
+          i++
+          source += '(?:.*/)?'
+        } else {
+          source += '.*'
+        }
+      } else {
+        source += '[^/]*'
+      }
+      continue
+    }
+    if (char === '?') {
+      source += '[^/]'
+      continue
+    }
+    source += char.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  }
+  return new RegExp(`${source}$`)
 }
 
 export function createHarnessTools(fs: HarnessFs): HarnessTool[] {
@@ -498,6 +556,38 @@ export function createHarnessTools(fs: HarnessFs): HarnessTool[] {
       },
     },
     {
+      name: 'findFiles',
+      description: 'Find files by glob pattern. Use it to locate files by name or extension, e.g. "src/**/*.ts" or "*.json".',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          pattern: { type: 'string', description: 'Glob pattern. Supports *, ** and ?.' },
+          path: { type: 'string', description: 'Optional directory limit, e.g. "src".' },
+        },
+        required: ['pattern'],
+      },
+      execute: async ({ pattern, path }) => {
+        const dir = String(path ?? '').trim()
+        const check = dir ? checkProjectPath(dir) : { path: '' }
+        if ('error' in check) return { error: check.error }
+        const glob = String(pattern ?? '').trim().replace(/\\/g, '/').replace(/^\.?\//, '')
+        if (!glob) return { error: 'pattern is required' }
+        if (glob.split('/').includes('..')) return { error: 'Patterns cannot traverse outside the project.' }
+        const matcher = globToRegExp(glob)
+        const matchFullPath = glob.includes('/')
+        const matches = (await filesUnder(check.path)).filter(file => {
+          const candidate = matchFullPath ? file : file.split('/').pop() || file
+          return matcher.test(candidate)
+        })
+        return {
+          pattern: glob,
+          count: matches.length,
+          files: matches.slice(0, MAX_FIND_MATCHES),
+          truncated: matches.length > MAX_FIND_MATCHES,
+        }
+      },
+    },
+    {
       name: 'readFile',
       description: 'Read a project file. Required before replaceInFile, editFile, or deleteFile. Optionally pass a 1-based line range for large files (max 600 lines / 24000 characters per call).',
       inputSchema: {
@@ -529,6 +619,59 @@ export function createHarnessTools(fs: HarnessFs): HarnessTool[] {
           truncated = true
         }
         return { path: file, startLine: start, endLine: end, totalLines, content: body, truncated }
+      },
+    },
+    {
+      name: 'getDiagnostics',
+      description: 'Return current editor diagnostics (errors and warnings) for open files. Use it after edits to check for broken imports, types or syntax.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'Optional file path filter.' },
+        },
+        required: [],
+      },
+      execute: async ({ path }) => {
+        if (!fs.getDiagnostics) return { error: 'Editor diagnostics are not available.' }
+        const filter = String(path ?? '').trim()
+        const check = filter ? checkProjectPath(filter) : null
+        if (check && 'error' in check) return { error: check.error }
+        const diagnostics = fs.getDiagnostics().filter(item => !check || item.path === check.path)
+        return {
+          count: diagnostics.length,
+          diagnostics: diagnostics.slice(0, 100),
+          truncated: diagnostics.length > 100,
+        }
+      },
+    },
+    {
+      name: 'getOpenFile',
+      description: 'Read the file currently open in the editor, including unsaved changes.',
+      inputSchema: { type: 'object', properties: {}, required: [] },
+      execute: async () => {
+        if (!fs.getOpenFile) return { error: 'No editor is available.' }
+        const open = fs.getOpenFile()
+        if (!open) return { error: 'No file is open in the editor.' }
+        return {
+          path: open.path,
+          content: truncate(open.content, MAX_EDITOR_TEXT),
+          truncated: open.content.length > MAX_EDITOR_TEXT,
+        }
+      },
+    },
+    {
+      name: 'getSelection',
+      description: 'Read the current editor selection and its line range.',
+      inputSchema: { type: 'object', properties: {}, required: [] },
+      execute: async () => {
+        if (!fs.getSelection) return { error: 'No editor is available.' }
+        const selection = fs.getSelection()
+        if (!selection || !selection.text.trim()) return { error: 'No text is selected in the editor.' }
+        return {
+          ...selection,
+          text: truncate(selection.text, MAX_EDITOR_TEXT),
+          truncated: selection.text.length > MAX_EDITOR_TEXT,
+        }
       },
     },
     {
