@@ -1,4 +1,4 @@
-import { streamText, jsonSchema, stepCountIs, type ModelMessage, type LanguageModel } from 'ai'
+import { streamText, stepCountIs, type ModelMessage, type LanguageModel } from 'ai'
 import { browserAI, doesBrowserSupportBrowserAI } from '@browser-ai/core'
 import { webLLM, doesBrowserSupportWebLLM } from '@browser-ai/web-llm'
 import { transformersJS, doesBrowserSupportTransformersJS } from '@browser-ai/transformers-js'
@@ -389,7 +389,24 @@ export async function initProviderModel(
       return model
     }
     case PROVIDERS.TRANSFORMERS_JS: {
+      // `navigator.gpu` can exist while `requestAdapter()` returns null (e.g.
+      // Linux with a blocked or unsupported GPU). The provider defaults to
+      // WebGPU based on the global alone, so pick the backend explicitly.
+      let device: 'wasm' | 'webgpu' = 'wasm'
+      let dtype: 'q4' | 'q4f16' = 'q4'
+      if (navigator.gpu) {
+        try {
+          if (await navigator.gpu.requestAdapter()) {
+            device = 'webgpu'
+            dtype = 'q4f16'
+          }
+        } catch {}
+      }
+      const worker = new Worker(new URL('./transformers-worker.ts', import.meta.url), { type: 'module' })
       const model = transformersJS(modelId, {
+        worker,
+        device,
+        dtype,
         initProgressCallback: (p) => {
           onProgress?.({ text: `Loading ${modelId}...`, progress: typeof p === 'number' ? p : 0 })
         },
@@ -411,74 +428,6 @@ interface CreateChatStreamOptions {
   model: LanguageModel | null
   messages: ModelMessage[]
   system?: string
-}
-
-export function createTools(
-  readFileFn: (path: string) => Promise<string | null>,
-  editFileFn: (path: string, content: string) => Promise<boolean>,
-  createFileFn: (path: string, content: string) => Promise<boolean>,
-  deleteFileFn: (path: string) => Promise<boolean>
-): any {
-  return {
-    readFile: {
-      description: 'Read the contents of a file in the project',
-      inputSchema: jsonSchema({
-        type: 'object',
-        properties: {
-          path: { type: 'string', description: 'File path relative to project root' },
-        },
-        required: ['path'],
-      }),
-      execute: async ({ path }: { path: string }) => {
-        const content = await readFileFn(path)
-        return content ? { path, content } : { error: `File not found: ${path}` }
-      },
-    },
-    editFile: {
-      description: 'Write content to an existing file. Overwrites the entire file.',
-      inputSchema: jsonSchema({
-        type: 'object',
-        properties: {
-          path: { type: 'string', description: 'File path relative to project root' },
-          content: { type: 'string', description: 'Full file content to write' },
-        },
-        required: ['path', 'content'],
-      }),
-      execute: async ({ path, content }: { path: string; content: string }) => {
-        const ok = await editFileFn(path, content)
-        return ok ? { path, success: true } : { error: `Failed to write ${path}` }
-      },
-    },
-    createFile: {
-      description: 'Create a new file with the given content. Fails if the file already exists.',
-      inputSchema: jsonSchema({
-        type: 'object',
-        properties: {
-          path: { type: 'string', description: 'File path relative to project root' },
-          content: { type: 'string', description: 'File content' },
-        },
-        required: ['path', 'content'],
-      }),
-      execute: async ({ path, content }: { path: string; content: string }) => {
-        const ok = await createFileFn(path, content)
-        return ok ? { path, success: true } : { error: `Failed to create ${path} (may already exist)` }
-      },
-    },
-    deleteFile: {
-      description: 'Delete a file from the project',
-      inputSchema: jsonSchema({
-        type: 'object',
-        properties: {
-          path: { type: 'string', description: 'File path relative to project root' },
-        },
-        required: ['path'],
-      }),
-      execute: async ({ path }: { path: string }) => {
-        const ok = await deleteFileFn(path)
-        return ok ? { path, success: true } : { error: `Failed to delete ${path}` }
-      },
-    },
-  }
 }
 
 export function createChatStream({ provider, model, messages, system, tools, abortSignal }: CreateChatStreamOptions & { tools?: Record<string, any>; abortSignal?: AbortSignal }) {

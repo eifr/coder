@@ -1,9 +1,10 @@
 import { html, render, Component, useState, useEffect, useRef, useCallback, useMemo } from 'htm/preact/standalone.mjs'
-import { PROVIDERS, getAvailableModels, estimateVRAM, getPreferredModel, checkProviderAvailability, getBrowserAIStatus, getBuiltInAICapabilities, getProviderLabel, initProviderModel, createChatStream, createTools, type Provider, type ModelDescriptor, type BuiltInApiInfo, type BuiltInApiStatus } from './llm-provider'
+import { PROVIDERS, getAvailableModels, estimateVRAM, getPreferredModel, checkProviderAvailability, getBrowserAIStatus, getBuiltInAICapabilities, getProviderLabel, initProviderModel, type Provider, type ModelDescriptor, type BuiltInApiInfo, type BuiltInApiStatus } from './llm-provider'
 import { createHarnessTools, type HarnessTool, type HarnessDiagnostic, type HarnessOpenFile, type HarnessSelection } from './chrome-harness'
 import { readRecentCommits, type RecentCommit } from './git-log'
+import { createLocalModels } from './pi-local-provider'
 import { Agent, type AgentMessage, type AgentTool } from '@earendil-works/pi-agent-core'
-import { Type } from '@earendil-works/pi-ai'
+import { Type, type Model, type Models } from '@earendil-works/pi-ai'
 import { CHROME_API, MODEL_ID, PROVIDER_ID, createChromeModels } from './pi-chrome-provider'
 import type { LanguageModel, ModelMessage } from 'ai'
 
@@ -904,14 +905,14 @@ function createChunkQueue(): ChunkQueue {
   }
 }
 
-async function* streamChromeAgent(
+async function* streamPiAgent(
+  models: Models,
+  model: Model<any>,
   messages: ModelMessage[],
   system: string | undefined,
   tools: HarnessTool[],
   signal?: AbortSignal
 ): AsyncGenerator<ChatChunk> {
-  const model = CHROME_MODEL.getModel(PROVIDER_ID, MODEL_ID)
-  if (!model) throw new Error('Chrome Built-in AI model is not registered.')
 
   const chat = messages.filter(message => message.role === 'user' || message.role === 'assistant')
   const last = chat[chat.length - 1]
@@ -935,7 +936,7 @@ async function* streamChromeAgent(
       tools: tools.map(toAgentTool),
       messages: toAgentHistory(chat.slice(0, -1)),
     },
-    streamFn: CHROME_MODEL.streamSimple.bind(CHROME_MODEL),
+    streamFn: models.streamSimple.bind(models),
     convertToLlm: messages => messages,
     toolExecution: 'sequential',
     finishTurn: async () => {
@@ -1019,59 +1020,22 @@ async function* streamChromeAgent(
   }
 }
 
-async function* streamChat(messages: ModelMessage[], system?: string, plainSystem?: string, tools?: HarnessTool[] | Record<string, any>, signal?: AbortSignal): AsyncGenerator<ChatChunk> {
+async function* streamChat(messages: ModelMessage[], system?: string, tools?: HarnessTool[], signal?: AbortSignal): AsyncGenerator<ChatChunk> {
   if (!currentModel) throw new Error('Model not initialized')
   const provider = (currentModel as any).provider || PROVIDERS.WEBLLM
 
   if (provider === PROVIDERS.BROWSER_AI) {
-    yield* streamChromeAgent(messages, system, Array.isArray(tools) ? tools : [], signal)
+    const model = CHROME_MODEL.getModel(PROVIDER_ID, MODEL_ID)
+    if (!model) throw new Error('Chrome Built-in AI model is not registered.')
+    yield* streamPiAgent(CHROME_MODEL, model, messages, system, tools || [], signal)
     return
   }
 
-  let full = ''
-  try {
-    const result = createChatStream({ provider, model: currentModel, messages, system, tools: tools as Record<string, any>, abortSignal: signal })
-    for await (const part of result.fullStream) {
-      if (signal?.aborted) break
-      if (part.type === 'text-delta') {
-        full += (part as any).text ?? (part as any).delta ?? ''
-        const cleaned = full.replace(/ thinking[\s\S]*?<\/think>/g, '').trim()
-        yield { text: cleaned, done: false, delta: (part as any).text ?? (part as any).delta ?? '', usage: null }
-      } else if ((part as any).type === 'reasoning-delta') {
-        // Some providers stream thinking as reasoning deltas; surface it so
-        // the bubble never stays empty while the model is working.
-        full += (part as any).delta ?? (part as any).text ?? ''
-        const cleaned = full.replace(/ thinking[\s\S]*?<\/think>/g, '').trim()
-        yield { text: cleaned, done: false, delta: (part as any).delta ?? '', usage: null }
-      } else if ((part as any).type === 'tool-call' || (part as any).type === 'tool-input-available' || (part as any).type === 'tool-input-start') {
-        console.log('Tool call:', (part as any).toolName || 'unknown tool', (part as any).input ?? (part as any).args)
-      } else if ((part as any).type === 'tool-result' || (part as any).type === 'tool-output-available') {
-        console.log('Tool result:', (part as any).toolName, (part as any).output)
-      } else if ((part as any).type === 'error') {
-        const raw = (part as any).error ?? (part as any).errorText ?? (part as any).message
-        const detail = raw instanceof Error ? raw.message : typeof raw === 'string' ? raw : JSON.stringify(raw ?? part)
-        console.error('Chat stream error part:', part)
-        throw new Error(detail || 'Stream error')
-      }
-    }
-    const cleaned = full.replace(/<think>[\s\S]*?<\/think>/g, '').trim()
-    yield { text: cleaned, done: true, delta: '', usage: null }
-  } catch (err) {
-    const msg = (err as Error).message || ''
-    if (msg.includes('mapAsync') || msg.includes('Buffer was unmapped')) {
-      console.warn('GPU buffer error, retrying...')
-      await new Promise(r => setTimeout(r, 500))
-      const cleaned = full.replace(/<think>[\s\S]*?<\/think>/g, '').trim()
-      yield { text: cleaned, done: true, delta: '', usage: null }
-      return
-    }
-    if (abortController?.signal.aborted) {
-      const cleaned = full.replace(/<think>[\s\S]*?<\/think>/g, '').trim()
-      yield { text: cleaned, done: true, delta: '', usage: null }
-      return
-    }
-    throw err
-  }
+  const modelId = (currentModel as any).modelId || 'local'
+  const localModels = createLocalModels({ provider, model: currentModel, modelId })
+  const model = localModels.getModels()[0]
+  if (!model) throw new Error('Local model is not registered.')
+  yield* streamPiAgent(localModels, model, messages, system, tools || [], signal)
 }
 
 function parseCodeBlocks(text: string): CodeBlock[] {
@@ -2542,37 +2506,32 @@ function App() {
     abortRef.current = false
 
     const fileTree = attachContext && treeData ? buildFileTree(treeData) : null
-    const isChromeAI = selectedProvider === PROVIDERS.BROWSER_AI
     let plainSystem = fileTree ? `${SYSTEM_PROMPT}\n\nProject file tree:\n${fileTree}` : SYSTEM_PROMPT
-    // Send the full conversation history on every turn: the Chrome harness
-    // creates a fresh Prompt API session per turn, so history is applied once.
+    // pi rebuilds the transcript per provider request, so send the full history.
     const chatMsgs: ModelMessage[] = [
       ...newMsgs
         .filter(m => m.role === 'user' || m.role === 'assistant')
         .map(m => ({ role: m.role, content: m.content } as ModelMessage)),
     ]
 
-    let tools: HarnessTool[] | Record<string, any> | undefined
+    let tools: HarnessTool[] | undefined
     if (attachContext) {
-      tools = isChromeAI
-        ? createHarnessTools({
-            listFiles: async () => { await ensureIndexed(); return [...fileHandles.keys()] },
-            readFile: readFileForTool,
-            writeFile: applyFileChanges,
-            createFile: createFileForTool,
-            deleteFile: deleteFileForTool,
-            getDiagnostics: collectEditorDiagnostics,
-            getOpenFile: readOpenFileForTool,
-            getSelection: readSelectionForTool,
-          })
-        : createTools(readFileForTool, applyFileChanges, createFileForTool, deleteFileForTool)
+      tools = createHarnessTools({
+        listFiles: async () => { await ensureIndexed(); return [...fileHandles.keys()] },
+        readFile: readFileForTool,
+        writeFile: applyFileChanges,
+        createFile: createFileForTool,
+        deleteFile: deleteFileForTool,
+        getDiagnostics: collectEditorDiagnostics,
+        getOpenFile: readOpenFileForTool,
+        getSelection: readSelectionForTool,
+      })
     }
 
-    // Chrome's on-device model has a small context window and no project-wide
-    // memory, so seed every turn with the open file. Without tools it needs the
-    // contents; with tools this saves an extra readFile round trip.
+    // Seed every turn with the open file. Small models lack project-wide memory;
+    // with tools this also saves an extra readFile round trip.
     let openFileBlock = ''
-    if (isChromeAI && currentFilePath && editor) {
+    if (currentFilePath && editor) {
       const model = editor.getModel()
       if (model) {
         let code = model.getValue()
@@ -2590,7 +2549,7 @@ function App() {
 
     try {
       let full = ''
-      for await (const chunk of streamChat(chatMsgs, systemMsg, plainSystem, tools, abortController.signal)) {
+      for await (const chunk of streamChat(chatMsgs, systemMsg, tools, abortController.signal)) {
         if (abortRef.current) break
         if (chunk.tool?.ok && chunk.tool.path) {
           const { name, path } = chunk.tool
@@ -2694,6 +2653,7 @@ function App() {
     try {
       const model = await initLLM(provider, modelId, (r) => setInitProgress({ text: r.text||`Preparing ${modelId}...`, progress: r.progress||0 }))
       ;(model as any).provider = provider
+      ;(model as any).modelId = modelId
       currentModel = model
       setModelLoaded(true)
       setInitProgress({ text: 'Model ready', progress: 1 })
@@ -2838,8 +2798,13 @@ function App() {
   `
 }
 
-function hasWebGPU(): boolean {
-  return !!navigator.gpu
+async function hasWebGPU(): Promise<boolean> {
+  if (!navigator.gpu) return false
+  try {
+    return !!(await navigator.gpu.requestAdapter())
+  } catch {
+    return false
+  }
 }
 
 async function hasBrowserAI(): Promise<boolean> {
@@ -2856,7 +2821,7 @@ async function hasBrowserAI(): Promise<boolean> {
 }
 
 async function checkAvailability() {
-  window.__gpuAvailable = hasWebGPU()
+  window.__gpuAvailable = await hasWebGPU()
   try {
     window.__transformersAvailable = await checkProviderAvailability(PROVIDERS.TRANSFORMERS_JS)
   } catch {

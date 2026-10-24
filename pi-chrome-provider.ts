@@ -37,19 +37,19 @@ interface LanguageModelGlobal {
   create(options: Record<string, unknown>): Promise<PromptSession>
 }
 
-interface StructuredToolCall {
+export interface StructuredToolCall {
   tool: string
   arguments: JsonObject
 }
 
-interface NativeToolCall {
+export interface NativeToolCall {
   callId?: string
   callID?: string
   name: string
   arguments?: Record<string, unknown>
 }
 
-type TranscriptMessage = TranscriptContext['messages'][number]
+export type TranscriptMessage = TranscriptContext['messages'][number]
 
 function getLanguageModel(): LanguageModelGlobal | undefined {
   const candidate = (globalThis as Record<string, unknown>).LanguageModel
@@ -73,7 +73,7 @@ export async function getChromeAvailability(): Promise<{
   }
 }
 
-function zeroUsage(): Usage {
+export function zeroUsage(): Usage {
   return {
     input: 0,
     output: 0,
@@ -97,7 +97,7 @@ function textOf(content: unknown): string {
 }
 
 /** Chrome's Prompt API text chunk: a plain string in older builds, a content object in newer ones. */
-function chunkText(chunk: unknown): string | undefined {
+export function chunkText(chunk: unknown): string | undefined {
   if (typeof chunk === 'string') return chunk
   if (!chunk || typeof chunk !== 'object' || !('type' in chunk) || chunk.type !== 'text') return undefined
   if ('value' in chunk && typeof chunk.value === 'string') return chunk.value
@@ -105,7 +105,7 @@ function chunkText(chunk: unknown): string | undefined {
   return undefined
 }
 
-function isContextOverflow(error: unknown): boolean {
+export function isContextOverflow(error: unknown): boolean {
   if (!(error instanceof Error)) return false
   return error.name === 'QuotaExceededError' || /context|too large|quota/i.test(error.message)
 }
@@ -115,7 +115,7 @@ function isContextOverflow(error: unknown): boolean {
  * the Prompt API tool protocol. Current Linux models emit markdown instead, so
  * the structured fallback below is the default path.
  */
-function nativeToolCall(chunk: unknown): NativeToolCall | undefined {
+export function nativeToolCall(chunk: unknown): NativeToolCall | undefined {
   if (!chunk || typeof chunk !== 'object' || !('type' in chunk) || chunk.type !== 'tool-call') return undefined
   if (!('value' in chunk) || !chunk.value || typeof chunk.value !== 'object') return undefined
   const value = chunk.value as Record<string, unknown>
@@ -133,7 +133,7 @@ function nativeToolCall(chunk: unknown): NativeToolCall | undefined {
  * builds, but it does honor `responseConstraint`. Tool calls are therefore
  * encoded as constrained JSON and translated back into pi tool calls.
  */
-function toPlainMessage(message: TranscriptMessage): unknown {
+export function toPlainMessage(message: TranscriptMessage): { role: 'user' | 'assistant'; content: string } {
   if (message.role === 'system') {
     throw new Error('System messages are sent through initialPrompts, not toPlainMessage().')
   }
@@ -152,7 +152,7 @@ function toPlainMessage(message: TranscriptMessage): unknown {
   }
 }
 
-function buildToolPrompt(system: string, tools: Tool[], forceText = false): string {
+export function buildToolPrompt(system: string, tools: Tool[], forceText = false): string {
   const declarations = tools.map(tool => [
     `- ${tool.name}: ${tool.description}`,
     `  arguments: ${JSON.stringify(tool.parameters)}`,
@@ -170,7 +170,7 @@ function buildToolPrompt(system: string, tools: Tool[], forceText = false): stri
   ].filter(Boolean).join('\n')
 }
 
-function buildTextSchema(): Record<string, unknown> {
+export function buildTextSchema(): Record<string, unknown> {
   return {
     type: 'object',
     properties: { text: { type: 'string' } },
@@ -182,7 +182,7 @@ function buildTextSchema(): Record<string, unknown> {
  * True when the model repeated the exact same tool call back to back. Current
  * on-device models can get stuck in that loop instead of answering.
  */
-function hasRepeatedToolCall(messages: TranscriptMessage[]): boolean {
+export function hasRepeatedToolCall(messages: TranscriptMessage[]): boolean {
   let previous: string | undefined
   for (const message of messages) {
     if (message.role !== 'assistant') continue
@@ -196,7 +196,7 @@ function hasRepeatedToolCall(messages: TranscriptMessage[]): boolean {
   return false
 }
 
-function countToolCalls(messages: TranscriptMessage[]): number {
+export function countToolCalls(messages: TranscriptMessage[]): number {
   let count = 0
   for (const message of messages) {
     if (message.role !== 'assistant') continue
@@ -207,7 +207,7 @@ function countToolCalls(messages: TranscriptMessage[]): number {
   return count
 }
 
-function buildToolSchema(tools: Tool[]): Record<string, unknown> {
+export function buildToolSchema(tools: Tool[]): Record<string, unknown> {
   return {
     anyOf: [
       {
@@ -227,7 +227,7 @@ function buildToolSchema(tools: Tool[]): Record<string, unknown> {
   }
 }
 
-function parseStructuredToolCall(raw: string, tools: Tool[]): StructuredToolCall | undefined {
+export function parseStructuredToolCall(raw: string, tools: Tool[]): StructuredToolCall | undefined {
   let parsed: unknown
   try {
     parsed = JSON.parse(raw)
@@ -242,7 +242,7 @@ function parseStructuredToolCall(raw: string, tools: Tool[]): StructuredToolCall
   return { tool: parsed.tool, arguments: parsed.arguments as JsonObject }
 }
 
-function structuredText(raw: string): string | undefined {
+export function structuredText(raw: string): string | undefined {
   try {
     const parsed: unknown = JSON.parse(raw)
     if (parsed && typeof parsed === 'object' && 'text' in parsed && typeof parsed.text === 'string') {
@@ -272,8 +272,115 @@ async function createSession(
   return languageModel.create(options)
 }
 
-function newToolCallId(): string {
+export function newToolCallId(): string {
   return globalThis.crypto?.randomUUID?.() ?? `tool-${Date.now()}-${Math.random().toString(36).slice(2)}`
+}
+
+/**
+ * Consumes text/native-tool chunks from any provider and emits pi events.
+ * Shared by the Prompt API and the AI SDK (WebLLM/Transformers) adapters.
+ */
+export async function consumeStructuredStream(
+  source: AsyncIterable<unknown>,
+  tools: Tool[],
+  message: AssistantMessage,
+  out: AssistantMessageEventStream,
+  signal?: AbortSignal,
+  forceText = false
+): Promise<void> {
+  const structured = tools.length > 0
+  let raw = ''
+  let textIndex = -1
+  let text = ''
+  const nativeCalls: NativeToolCall[] = []
+
+  for await (const chunk of source) {
+    if (signal?.aborted) break
+    const native = nativeToolCall(chunk)
+    if (native) {
+      nativeCalls.push(native)
+      continue
+    }
+    const delta = chunkText(chunk)
+    if (delta === undefined) continue
+    if (structured) {
+      raw += delta
+      continue
+    }
+    if (textIndex < 0) {
+      textIndex = message.content.length
+      message.content.push({ type: 'text', text: '' })
+      out.push({ type: 'text_start', contentIndex: textIndex, partial: { ...message } })
+    }
+    text += delta
+    const block = message.content[textIndex]
+    if (block.type === 'text') block.text = text
+    out.push({ type: 'text_delta', contentIndex: textIndex, delta, partial: { ...message } })
+  }
+
+  if (signal?.aborted) return
+
+  if (nativeCalls.length > 0) {
+    for (const native of nativeCalls) {
+      const index = message.content.length
+      // Native providers validate tool arguments against inputSchema.
+      const args = (native.arguments ?? {}) as JsonObject
+      const call = {
+        type: 'toolCall' as const,
+        id: native.callId ?? newToolCallId(),
+        name: native.name,
+        arguments: args,
+      }
+      message.content.push(call)
+      out.push({ type: 'toolcall_start', contentIndex: index, partial: { ...message } })
+      out.push({
+        type: 'toolcall_delta',
+        contentIndex: index,
+        delta: JSON.stringify(call.arguments),
+        partial: { ...message },
+      })
+      out.push({ type: 'toolcall_end', contentIndex: index, toolCall: call, partial: { ...message } })
+    }
+    return
+  }
+
+  if (structured) {
+    const toolCall = forceText ? undefined : parseStructuredToolCall(raw, tools)
+    if (toolCall) {
+      const index = message.content.length
+      const call = {
+        type: 'toolCall' as const,
+        id: newToolCallId(),
+        name: toolCall.tool,
+        arguments: toolCall.arguments,
+      }
+      message.content.push(call)
+      out.push({ type: 'toolcall_start', contentIndex: index, partial: { ...message } })
+      out.push({
+        type: 'toolcall_delta',
+        contentIndex: index,
+        delta: JSON.stringify(call.arguments),
+        partial: { ...message },
+      })
+      out.push({ type: 'toolcall_end', contentIndex: index, toolCall: call, partial: { ...message } })
+      return
+    }
+    const answer = structuredText(raw) ?? raw
+    if (answer) {
+      textIndex = message.content.length
+      message.content.push({ type: 'text', text: answer })
+      out.push({ type: 'text_start', contentIndex: textIndex, partial: { ...message } })
+      out.push({ type: 'text_delta', contentIndex: textIndex, delta: answer, partial: { ...message } })
+      out.push({ type: 'text_end', contentIndex: textIndex, content: answer, partial: { ...message } })
+    } else {
+      console.warn('[pi-structured] model returned an empty structured response.', raw)
+    }
+    return
+  }
+
+  if (textIndex >= 0) {
+    out.push({ type: 'text_end', contentIndex: textIndex, content: text, partial: { ...message } })
+  }
 }
 
 function streamSimple(
@@ -334,98 +441,7 @@ function streamSimple(
 
       stream.push({ type: 'start', partial: { ...message } })
 
-      let raw = ''
-      let textIndex = -1
-      let text = ''
-      const nativeCalls: NativeToolCall[] = []
-
-      for await (const chunk of session.promptStreaming(promptInput, promptOptions)) {
-        if (signal?.aborted) break
-        const native = nativeToolCall(chunk)
-        if (native) {
-          nativeCalls.push(native)
-          continue
-        }
-        const delta = chunkText(chunk)
-        if (delta === undefined) continue
-        if (structured) {
-          raw += delta
-          continue
-        }
-        if (textIndex < 0) {
-          textIndex = message.content.length
-          message.content.push({ type: 'text', text: '' })
-          stream.push({ type: 'text_start', contentIndex: textIndex, partial: { ...message } })
-        }
-        text += delta
-        const block = message.content[textIndex]
-        if (block.type === 'text') block.text = text
-        stream.push({ type: 'text_delta', contentIndex: textIndex, delta, partial: { ...message } })
-      }
-
-      if (signal?.aborted) {
-        message.stopReason = 'aborted'
-        message.errorMessage = 'Request aborted.'
-        stream.push({ type: 'error', reason: 'aborted', error: message })
-        stream.end(message)
-        return
-      }
-
-      if (nativeCalls.length > 0) {
-        for (const native of nativeCalls) {
-          const index = message.content.length
-          // Prompt API validates native tool arguments against inputSchema.
-          const args = (native.arguments ?? {}) as JsonObject
-          const call = {
-            type: 'toolCall' as const,
-            id: native.callId ?? newToolCallId(),
-            name: native.name,
-            arguments: args,
-          }
-          message.content.push(call)
-          stream.push({ type: 'toolcall_start', contentIndex: index, partial: { ...message } })
-          stream.push({
-            type: 'toolcall_delta',
-            contentIndex: index,
-            delta: JSON.stringify(call.arguments),
-            partial: { ...message },
-          })
-          stream.push({ type: 'toolcall_end', contentIndex: index, toolCall: call, partial: { ...message } })
-        }
-      } else if (structured) {
-        const toolCall = parseStructuredToolCall(raw, tools)
-        if (toolCall) {
-          const index = message.content.length
-          const call = {
-            type: 'toolCall' as const,
-            id: newToolCallId(),
-            name: toolCall.tool,
-            arguments: toolCall.arguments,
-          }
-          message.content.push(call)
-          stream.push({ type: 'toolcall_start', contentIndex: index, partial: { ...message } })
-          stream.push({
-            type: 'toolcall_delta',
-            contentIndex: index,
-            delta: JSON.stringify(call.arguments),
-            partial: { ...message },
-          })
-          stream.push({ type: 'toolcall_end', contentIndex: index, toolCall: call, partial: { ...message } })
-        } else {
-          const answer = structuredText(raw) ?? raw
-          if (answer) {
-            textIndex = message.content.length
-            message.content.push({ type: 'text', text: answer })
-            stream.push({ type: 'text_start', contentIndex: textIndex, partial: { ...message } })
-            stream.push({ type: 'text_delta', contentIndex: textIndex, delta: answer, partial: { ...message } })
-            stream.push({ type: 'text_end', contentIndex: textIndex, content: answer, partial: { ...message } })
-          } else {
-            console.warn('[pi-chrome] model returned an empty structured response.', raw)
-          }
-        }
-      } else if (textIndex >= 0) {
-        stream.push({ type: 'text_end', contentIndex: textIndex, content: text, partial: { ...message } })
-      }
+      await consumeStructuredStream(session.promptStreaming(promptInput, promptOptions), tools, message, stream, signal, forceText)
 
       const after = session.contextUsage ?? inputTokens
       const outputTokens = Math.max(0, after - inputTokens)
