@@ -77,7 +77,7 @@ interface ChatChunk {
   usage: unknown
   /** Human-readable loading state, e.g. while the on-device model prepares. */
   status?: string
-  tool?: { name: string; path?: string; from?: string; ok?: boolean }
+  tool?: { name: string; path?: string; from?: string; ok?: boolean; error?: string }
 }
 
 declare global {
@@ -523,7 +523,15 @@ function openWorkspaceDb(): Promise<IDBDatabase> {
       if (!db.objectStoreNames.contains(WORKSPACE_STORE)) db.createObjectStore(WORKSPACE_STORE)
       if (!db.objectStoreNames.contains(SESSION_STORE)) db.createObjectStore(SESSION_STORE)
     }
-    request.onsuccess = () => resolve(request.result)
+    // Another tab still holding an older version would otherwise leave this
+    // request pending forever, so the project and session would never load.
+    request.onblocked = () => reject(new Error('IndexedDB upgrade is blocked by another open tab'))
+    request.onsuccess = () => {
+      const db = request.result
+      // Release the version so a future migration is never blocked by us.
+      db.onversionchange = () => db.close()
+      resolve(db)
+    }
     request.onerror = () => reject(request.error)
   })
 }
@@ -544,6 +552,15 @@ async function storeRootHandle(handle: FileSystemDirectoryHandle): Promise<void>
   }
 }
 
+let blockedDbWarned = false
+
+/** A blocked upgrade leaves every read pending, so say why once instead of hanging. */
+function noteBlockedDb(err: unknown): void {
+  if (blockedDbWarned || !(err instanceof Error) || !/blocked/i.test(err.message)) return
+  blockedDbWarned = true
+  addNotification('Another Coder tab is using local storage. Close it, then reload.', 'warning')
+}
+
 async function readStoredRootHandle(): Promise<FileSystemDirectoryHandle | null> {
   try {
     const db = await openWorkspaceDb()
@@ -556,6 +573,7 @@ async function readStoredRootHandle(): Promise<FileSystemDirectoryHandle | null>
     db.close()
     return handle
   } catch (err) {
+    noteBlockedDb(err)
     console.warn('readStoredRootHandle:', err)
     return null
   }
@@ -1022,6 +1040,13 @@ function legacyTranscript(messages: Message[]): AgentMessage[] {
   return transcript
 }
 
+/** A harness tool reports failure by returning `{ error }` instead of throwing. */
+function toolErrorText(value: unknown): string | null {
+  if (!value || typeof value !== 'object' || !('error' in value)) return null
+  const error = (value as { error?: unknown }).error
+  return typeof error === 'string' && error ? error : null
+}
+
 function toAgentTool(tool: HarnessTool): AgentTool {
   return {
     name: tool.name,
@@ -1032,6 +1057,12 @@ function toAgentTool(tool: HarnessTool): AgentTool {
       // pi validated the arguments against the same JSON Schema the app declares.
       const args = params as Record<string, unknown>
       const value = await tool.execute(args)
+      const error = toolErrorText(value)
+      if (error) {
+        // Without this the model reads a *successful* tool result, believes the
+        // edit landed, and answers as if it had.
+        return { content: [{ type: 'text', text: error }], details: undefined, isError: true }
+      }
       const text = typeof value === 'string' ? value : JSON.stringify(value, null, 2) ?? 'null'
       return {
         content: [{
@@ -1171,7 +1202,13 @@ async function* streamPiAgent(
         done: false,
         delta: '',
         usage: null,
-        tool: { name: event.toolName, path, from, ok: !event.isError },
+        tool: {
+          name: event.toolName,
+          path,
+          from,
+          ok: !event.isError,
+          error: event.isError ? lastToolResult.slice(0, 200) : undefined,
+        },
       })
     }
   })
@@ -2666,32 +2703,49 @@ function App() {
 
   // Restore the last project without a picker. Reloads keep an already granted
   // permission; after a browser restart Chrome reports "prompt", which needs a
-  // click, so offer a button instead of failing silently.
+  // click, so offer a button instead of failing silently. The stored handle is
+  // forgotten only when Chrome reports the permission as denied: a transient
+  // failure used to delete the project pointer and leave the next reload with
+  // nothing to restore.
   useEffect(() => {
     let alive = true
     ;(async () => {
       const handle = await readStoredRootHandle()
       if (!handle || !alive) return
+      let permission: PermissionState = 'prompt'
       try {
-        const permission = await handle.queryPermission({ mode: 'readwrite' })
-        if (permission === 'granted') {
-          const entries = await activateFolder(handle, setIndexedCount)
-          if (entries && alive) {
-            await applyFolder(entries)
-            if (saved.projectName === handle.name) {
-              const files = [...(saved.openFiles ?? [])]
-              if (saved.selectedFile && !files.includes(saved.selectedFile)) files.push(saved.selectedFile)
-              void restoreTabs(files, saved.selectedFile ?? null)
-            }
-          }
-        } else if (permission === 'prompt') {
-          setRestorableProject(handle.name)
-        } else {
-          void clearStoredRootHandle()
+        permission = await handle.queryPermission({ mode: 'readwrite' })
+      } catch (err) {
+        console.warn('[coder] could not check the stored project permission', err)
+        if (alive) setRestorableProject(handle.name)
+        return
+      }
+      if (!alive) return
+      console.info('[coder] restore project', handle.name, permission)
+      if (permission === 'denied') {
+        void clearStoredRootHandle()
+        return
+      }
+      if (permission !== 'granted') {
+        setRestorableProject(handle.name)
+        addNotification(`Click "Reopen ${handle.name}" to restore project files and tools.`)
+        return
+      }
+      try {
+        const entries = await activateFolder(handle, setIndexedCount)
+        if (!entries || !alive) return
+        await applyFolder(entries)
+        if (saved.projectName === handle.name) {
+          const files = [...(saved.openFiles ?? [])]
+          if (saved.selectedFile && !files.includes(saved.selectedFile)) files.push(saved.selectedFile)
+          void restoreTabs(files, saved.selectedFile ?? null)
         }
       } catch (err) {
-        console.warn('restore folder:', err)
-        void clearStoredRootHandle()
+        console.warn('[coder] restore folder failed', err)
+        if (alive) {
+          setRestorableProject(handle.name)
+          addNotification(`Could not reopen ${handle.name}. Click Reopen to try again.`, 'warning')
+        }
       }
     })()
     return () => { alive = false }
@@ -2720,8 +2774,7 @@ function App() {
     } catch (err) {
       console.error('restore folder:', err)
       addNotification(`Could not reopen ${handle.name}.`, 'error')
-      void clearStoredRootHandle()
-      setRestorableProject(null)
+      setRestorableProject(handle.name)
     }
   }, [applyFolder, restoreTabs])
 
@@ -2936,6 +2989,10 @@ function App() {
             if (selectedFile === path) setSelectedFile(null)
           }
           if (MUTATING_TOOLS.has(name)) void refreshTree()
+        } else if (chunk.tool?.ok === false && MUTATING_TOOLS.has(chunk.tool.name)) {
+          // A failed edit changes nothing; say so instead of letting the model
+          // claim success.
+          addNotification(`${chunk.tool.name} failed: ${chunk.tool.error || 'no change was made'}`, 'error')
         }
         if (chunk.status) setGenerationStatus(chunk.status)
         full = chunk.text
