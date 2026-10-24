@@ -300,8 +300,18 @@ export async function consumeStructuredStream(
   let textIndex = -1
   let text = ''
   const nativeCalls: NativeToolCall[] = []
+  let chunkCount = 0
+  const sample: string[] = []
 
   for await (const chunk of source) {
+    chunkCount++
+    if (sample.length < 5) {
+      if (typeof chunk === 'string') sample.push(`string:${chunk.slice(0, 80)}`)
+      else if (chunk && typeof chunk === 'object') {
+        const type = 'type' in chunk ? String(chunk.type) : ''
+        sample.push(`object:${Object.keys(chunk).join(',')}${type ? ` type=${type}` : ''}`)
+      } else sample.push(String(chunk))
+    }
     if (signal?.aborted) break
     const native = nativeToolCall(chunk)
     if (native) {
@@ -388,6 +398,10 @@ export async function consumeStructuredStream(
   if (textIndex >= 0) {
     out.push({ type: 'text_end', contentIndex: textIndex, content: text, partial: { ...message } })
   }
+
+  if (message.content.length === 0) {
+    console.warn('[pi-structured] model produced no content', { chunkCount, sample, rawLength: raw.length })
+  }
 }
 
 function streamSimple(
@@ -450,13 +464,38 @@ function streamSimple(
 
       await consumeStructuredStream(session.promptStreaming(promptInput, promptOptions), tools, message, stream, signal, forceText)
 
-      const after = session.contextUsage ?? inputTokens
-      const outputTokens = Math.max(0, after - inputTokens)
-      message.usage = {
-        ...zeroUsage(),
-        input: inputTokens,
-        output: outputTokens,
-        totalTokens: inputTokens + outputTokens,
+      // Some Chrome builds ignore responseConstraint and return no text at all.
+      // Retry once as a plain text session so the user still gets an answer.
+      if (structured && message.content.length === 0 && !signal?.aborted) {
+        console.warn('[pi-chrome] structured response was empty; retrying as plain text.')
+        session.destroy?.()
+        session = await createSession(languageModel, system, history, [], signal, false)
+        const retryInput = session.contextUsage ?? 0
+        await consumeStructuredStream(
+          session.promptStreaming(promptInput, signal ? { signal } : undefined),
+          [],
+          message,
+          stream,
+          signal,
+          false
+        )
+        const afterRetry = session.contextUsage ?? retryInput
+        const outputTokens = Math.max(0, afterRetry - retryInput)
+        message.usage = {
+          ...zeroUsage(),
+          input: retryInput,
+          output: outputTokens,
+          totalTokens: retryInput + outputTokens,
+        }
+      } else {
+        const after = session.contextUsage ?? inputTokens
+        const outputTokens = Math.max(0, after - inputTokens)
+        message.usage = {
+          ...zeroUsage(),
+          input: inputTokens,
+          output: outputTokens,
+          totalTokens: inputTokens + outputTokens,
+        }
       }
       message.stopReason = message.content.some(block => block.type === 'toolCall') ? 'toolUse' : 'stop'
       stream.push({ type: 'done', reason: message.stopReason, message })

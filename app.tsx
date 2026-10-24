@@ -2575,8 +2575,9 @@ function App() {
         .map(m => ({ role: m.role, content: m.content } as ModelMessage)),
     ]
 
+    const useContext = attachContext && !!treeData
     let tools: HarnessTool[] | undefined
-    if (attachContext) {
+    if (useContext) {
       tools = createHarnessTools({
         listFiles: async () => { await ensureIndexed(); return [...fileHandles.keys()] },
         readFile: readFileForTool,
@@ -2605,7 +2606,7 @@ function App() {
       }
     }
 
-    const systemMsg = attachContext
+    const systemMsg = useContext
       ? (fileTree ? `${TOOL_SYSTEM_PROMPT}\n\nProject file tree:\n${fileTree}${openFileBlock}` : `${TOOL_SYSTEM_PROMPT}${openFileBlock}`)
       : plainSystem
 
